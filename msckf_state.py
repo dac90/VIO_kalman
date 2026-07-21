@@ -173,3 +173,50 @@ def augment(state, T_BS):
                        state.clone_positions + [p_cam],
                        state.clone_orientations + [q_cam],
                        P_aug)
+
+
+def marginalize_clones(state, indices_to_remove):
+    """Drop the given camera clones (0-based indices into clone_positions/orientations) from the state.
+
+    Plain deletion: the corresponding rows/columns are dropped from P
+    outright, with no Schmidt-filter-style prior-fixing step. That's valid
+    precisely because a clone is only ever marginalized after every feature
+    it observed has already triggered its EKF update (stage 6) -- by then the
+    clone carries no information that hasn't already been folded into the
+    surviving state, so simply deleting it loses nothing.
+    """
+    indices_to_remove = sorted(set(indices_to_remove))
+    if not indices_to_remove:
+        return state
+
+    keep_clone_idx = [i for i in range(state.n_clones) if i not in indices_to_remove]
+
+    keep_cols = list(range(N_IMU_ERROR))
+    for i in keep_clone_idx:
+        off = N_IMU_ERROR + N_CLONE_ERROR * i
+        keep_cols.extend(range(off, off + N_CLONE_ERROR))
+
+    P_new = state.P[np.ix_(keep_cols, keep_cols)]
+
+    return MSCKFState(state.p, state.v, state.q, state.b_g, state.b_a,
+                       [state.clone_positions[i] for i in keep_clone_idx],
+                       [state.clone_orientations[i] for i in keep_clone_idx],
+                       P_new)
+
+
+def marginalize_clone(state, index):
+    """Drop a single camera clone by index."""
+    return marginalize_clones(state, [index])
+
+
+def marginalize_oldest_clone(state):
+    """Drop the oldest (first-added, index 0) camera clone -- clones are always appended, so index 0 is oldest."""
+    return marginalize_clone(state, 0)
+
+
+def enforce_sliding_window(state, max_clones):
+    """Marginalize the oldest clone(s), if needed, so at most max_clones remain."""
+    n_to_remove = state.n_clones - max_clones
+    if n_to_remove <= 0:
+        return state
+    return marginalize_clones(state, range(n_to_remove))

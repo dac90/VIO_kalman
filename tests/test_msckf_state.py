@@ -12,7 +12,19 @@ import pytest
 
 from frames import body_to_sensor_position, body_to_sensor_quaternion, load_T_BS
 from imu_propagation import MAV0_DIR, _load_imu_measurements, propagate_step
-from msckf_state import MSCKFState, N_IMU_ERROR, augment, imu_error_jacobians, load_imu_noise_params, propagate
+from msckf_state import (
+    MSCKFState,
+    N_CLONE_ERROR,
+    N_IMU_ERROR,
+    augment,
+    enforce_sliding_window,
+    imu_error_jacobians,
+    load_imu_noise_params,
+    marginalize_clone,
+    marginalize_clones,
+    marginalize_oldest_clone,
+    propagate,
+)
 from quaternion_utils import axis_angle_to_quat, quat_error_vector, quat_multiply
 
 EPS = 1e-6
@@ -144,3 +156,97 @@ def test_covariance_stays_symmetric_positive_semidefinite():
         assert eigenvalues.min() > -1e-9, f"step {i}: P not PSD, min eigenvalue {eigenvalues.min()}"
 
     assert state.n_clones == 5
+
+
+def _distinguishable_state(n_clones):
+    """A state whose clones/P entries are all individually identifiable, for testing marginalization bookkeeping."""
+    clone_positions = [np.array([float(i), 0.0, 0.0]) for i in range(n_clones)]
+    clone_orientations = [axis_angle_to_quat(np.array([0.0, 0.0, 0.1 * (i + 1)])) for i in range(n_clones)]
+    clone_orientations = [q / np.linalg.norm(q) for q in clone_orientations]
+
+    n = N_IMU_ERROR + N_CLONE_ERROR * n_clones
+    P = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            P[i, j] = 1000 * i + j  # every entry uniquely identifies its (row, col)
+
+    return MSCKFState(np.zeros(3), np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]), np.zeros(3), np.zeros(3),
+                       clone_positions, clone_orientations, P)
+
+
+def test_marginalize_clone_drops_correct_clone_and_index_range():
+    state = _distinguishable_state(4)  # clones 0,1,2,3 -> P column ranges [15,21),[21,27),[27,33),[33,39)
+    updated = marginalize_clone(state, 1)
+
+    assert updated.n_clones == 3
+    assert [p[0] for p in updated.clone_positions] == [0.0, 2.0, 3.0]  # clone 1 (x=1.0) dropped
+    assert updated.P.shape == (state.P.shape[0] - N_CLONE_ERROR, state.P.shape[0] - N_CLONE_ERROR)
+
+    # hand-picked (not re-derived from the implementation's own loop) column ranges to keep
+    expected_cols = list(range(15)) + list(range(15, 21)) + list(range(27, 33)) + list(range(33, 39))
+    expected_P = state.P[np.ix_(expected_cols, expected_cols)]
+    assert np.array_equal(updated.P, expected_P)
+
+
+def test_marginalize_oldest_clone_matches_marginalize_clone_zero():
+    state = _distinguishable_state(3)
+    via_oldest = marginalize_oldest_clone(state)
+    via_index = marginalize_clone(state, 0)
+
+    assert np.array_equal(via_oldest.P, via_index.P)
+    assert via_oldest.n_clones == 2
+    assert via_oldest.clone_positions[0][0] == 1.0  # clone 0 (x=0.0) dropped, clone 1 (x=1.0) now first
+
+
+def test_marginalize_clones_handles_noncontiguous_indices():
+    state = _distinguishable_state(5)
+    updated = marginalize_clones(state, [0, 2])
+    assert updated.n_clones == 3
+    assert [p[0] for p in updated.clone_positions] == [1.0, 3.0, 4.0]
+
+
+def test_marginalize_clones_empty_list_is_a_noop():
+    state = _distinguishable_state(3)
+    updated = marginalize_clones(state, [])
+    assert updated.n_clones == 3
+    assert np.array_equal(updated.P, state.P)
+
+
+def test_enforce_sliding_window_keeps_most_recent_clones():
+    state = _distinguishable_state(10)
+    updated = enforce_sliding_window(state, max_clones=4)
+    assert updated.n_clones == 4
+    assert [p[0] for p in updated.clone_positions] == [6.0, 7.0, 8.0, 9.0]  # oldest 6 dropped
+
+
+def test_enforce_sliding_window_is_a_noop_when_already_under_the_limit():
+    state = _distinguishable_state(3)
+    updated = enforce_sliding_window(state, max_clones=10)
+    assert updated.n_clones == 3
+    assert np.array_equal(updated.P, state.P)
+
+
+def test_sliding_window_stays_bounded_over_many_propagate_augment_steps():
+    p0, v0, q0 = np.zeros(3), np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
+    P0 = np.eye(N_IMU_ERROR) * 1e-4
+    state = MSCKFState.initialize(p0, v0, q0, np.zeros(3), np.zeros(3), P0)
+    noise_params = load_imu_noise_params()
+    T_BS = load_T_BS(f"{MAV0_DIR}/cam0/sensor.yaml")
+    timestamps, gyro, accel = _load_imu_measurements()
+
+    max_clones = 8
+    dt = 0.005
+    for i in range(300):
+        state = propagate(state, gyro[i], accel[i], dt, noise_params)
+        if i % 10 == 0:
+            state = augment(state, T_BS)
+            state = enforce_sliding_window(state, max_clones)
+
+        assert state.n_clones <= max_clones
+        expected_dim = N_IMU_ERROR + N_CLONE_ERROR * state.n_clones
+        assert state.P.shape == (expected_dim, expected_dim)
+        assert np.allclose(state.P, state.P.T, atol=1e-9)
+        eigenvalues = np.linalg.eigvalsh(state.P)
+        assert eigenvalues.min() > -1e-9, f"step {i}: P not PSD, min eigenvalue {eigenvalues.min()}"
+
+    assert state.n_clones == max_clones  # window should have filled up and stayed capped
