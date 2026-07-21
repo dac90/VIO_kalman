@@ -57,12 +57,13 @@ def propagate_step(p, v, q, gyro, accel, dt, bias_gyro=np.zeros(3), bias_accel=n
     return p_new, v_new, q_new
 
 
-def propagate_imu_trajectory(p0, v0, q0, t0, mav0_dir=MAV0_DIR):
+def propagate_imu_trajectory(p0, v0, q0, t0, mav0_dir=MAV0_DIR, bias_gyro=np.zeros(3), bias_accel=np.zeros(3)):
     """Dead-reckon imu0 measurements from timestamp t0 (ns) onward.
 
     (p0, v0, q0) is the known state at t0; t0 need not be an exact imu0
     sample timestamp (the first interval is integrated over the partial dt up
-    to the next real sample).
+    to the next real sample). bias_gyro/bias_accel are held fixed (constant)
+    over the whole run, applied at every step exactly as propagate_step does.
 
     Returns (timestamps, positions, velocities, quaternions), one entry per
     imu0 sample at/after t0, with the first entry equal to (t0, p0, v0, q0).
@@ -85,7 +86,7 @@ def propagate_imu_trajectory(p0, v0, q0, t0, mav0_dir=MAV0_DIR):
         # start of this interval, i.e. index start_idx + i - 2 (clamped to 0
         # for the case t0 precedes every imu0 sample)
         meas_idx = max(start_idx + i - 2, 0)
-        p, v, q = propagate_step(p, v, q, gyro[meas_idx], accel[meas_idx], dt)
+        p, v, q = propagate_step(p, v, q, gyro[meas_idx], accel[meas_idx], dt, bias_gyro, bias_accel)
         positions[i], velocities[i], quaternions[i] = p, v, q
 
     return timestamps, positions, velocities, quaternions

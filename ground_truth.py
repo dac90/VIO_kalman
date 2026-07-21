@@ -235,6 +235,7 @@ if __name__ == "__main__":
     p0, q0, v0 = gt_raw_positions[0], gt_raw_quaternions[0], gt_raw_velocities[0]
     imu_timestamps, imu_positions_raw, _, imu_quaternions_raw = propagate_imu_trajectory(
         p0, v0, q0, int(gt_timestamps[0]))
+    #, os.path.join(os.path.dirname(os.path.abspath(__file__)), "machine_hall", "MH_01_easy", "MH_01_easy", "mav0"), np.array([-0.00233173, 0.02172386, 0.07821335]), np.array([-0.04066623, 0.1155297, 0.05121861]))
     imu_position_interp = SequentialInterpolator(imu_timestamps, imu_positions_raw,
                                                   exact_match_tolerance=EXACT_MATCH_TOLERANCE_NS)
     imu_orientation_interp = QuaternionSequentialInterpolator(imu_timestamps, imu_quaternions_raw,
