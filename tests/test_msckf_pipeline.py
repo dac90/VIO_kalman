@@ -106,6 +106,80 @@ def test_is_stationary_distinguishes_a_still_imu_from_a_moving_one():
     assert not moving_pipeline._zupt_active
 
 
+def test_vision_noise_scale_is_neutral_before_window_fills():
+    pipeline = _minimal_pipeline(zupt_window_samples=10)
+    gravity = np.array([0.0, 0.0, 9.81])
+    for _ in range(9):
+        pipeline.process_imu(np.zeros(3), gravity, 0.005)
+    assert pipeline._vision_noise_scale == 1.0
+
+
+def test_vision_noise_scale_is_neutral_during_clear_motion():
+    # the Lorentzian falloff only asymptotically approaches 1.0, never hits it exactly, so
+    # this checks "close enough to be a no-op" rather than bit-exact equality.
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50)
+    for i in range(50):
+        gyro = np.array([0.3, 0.0, 0.0]) * np.sin(i * 0.3)
+        accel = gravity + np.array([1.5, 0.5, 0.0]) * np.cos(i * 0.3)
+        pipeline.process_imu(gyro, accel, 0.005)
+    assert not pipeline._zupt_active
+    assert pipeline._vision_noise_scale < 1.01
+
+
+def test_vision_noise_scale_grows_when_stationary_and_respects_the_configured_cap():
+    # a near-perfectly-still signal pushes the GLRT test statistic close to zero, i.e.
+    # stationarity_ratio -> 0 -- exactly the regime vision_trust_max_inflation caps.
+    rng = np.random.default_rng(5)
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50, vision_trust_max_inflation=8.0)
+    for _ in range(50):
+        pipeline.process_imu(rng.normal(size=3) * 1e-6, gravity + rng.normal(size=3) * 1e-6, 0.005)
+    assert pipeline._zupt_active
+    assert pipeline._vision_noise_scale > 7.9  # approaches, never quite reaches, the 8.0 cap
+    assert pipeline._vision_noise_scale <= 8.0  # but never exceeds it
+
+
+def test_vision_noise_scale_starts_discounting_before_the_binary_gate_fires():
+    # the whole point of 1c: unlike the very first version of this formula (which only
+    # started discounting once stationarity_ratio was already below 1 -- i.e. the same
+    # instant the binary gate fires, adding nothing beforehand), this one should already be
+    # meaningfully below the cap and above 1.0 while _zupt_active is still False, given a
+    # signal that's clearly quieter than real flight but not yet clean enough to pass the
+    # strict instantaneous test.
+    rng = np.random.default_rng(7)
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50, vision_trust_max_inflation=50.0)
+    for _ in range(50):
+        pipeline.process_imu(rng.normal(size=3) * 3e-2, gravity + rng.normal(size=3) * 3e-2, 0.005)
+    assert not pipeline._zupt_active  # too noisy to pass the strict instantaneous test yet
+    assert pipeline._vision_noise_scale > 3.0  # but already meaningfully discounted (ratio~3.4 here)
+
+
+def test_vision_noise_scale_tracks_instantaneous_signal_even_while_hysteresis_holds_zupt_active():
+    # 1c is deliberately *not* hysteresis-protected the way _zupt_active is (see
+    # _update_stationary_state's docstring): during a brief vibration blip, ZUPT should stay
+    # latched on (see test_is_stationary_survives_a_brief_vibration_blip_via_hysteresis), but
+    # vision's trust should immediately reflect the blip's real motion-like signal instead of
+    # staying inflated just because the sticky ZUPT gate hasn't (yet) turned off.
+    rng = np.random.default_rng(6)
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50, zupt_hold_seconds=0.5)
+
+    for _ in range(50):
+        pipeline.process_imu(rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+    assert pipeline._zupt_active
+    pre_blip_scale = pipeline._vision_noise_scale
+    assert pre_blip_scale > 40.0  # near the cap: this window looks essentially motionless
+
+    for _ in range(5):
+        pipeline.process_imu(np.array([0.3, 0.0, 0.0]), gravity + np.array([1.0, 0.0, 0.0]), 0.005)
+        assert pipeline._zupt_active  # hysteresis holds this on
+    # vision trust already reacted to the blip's real-motion-like signal, well before
+    # hysteresis lets the sticky ZUPT gate itself turn off
+    assert pipeline._vision_noise_scale < pre_blip_scale / 10
+
+
 def test_stationary_detector_scales_with_declared_imu_noise_density():
     # the whole point of the GLRT stationary detector (1b) over the hand-tuned thresholds
     # it replaced: the same borderline signal should be judged differently depending on how

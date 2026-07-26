@@ -36,6 +36,48 @@ IMU sample (200Hz) rather than once per camera frame (20Hz) as an earlier
 version did, since none of this depends on camera frames at all -- reacting
 to a stop up to 10x faster.
 
+_update_stationary_state also drives a second, continuous mechanism (1c):
+vision's observation noise (used in _process_ready_tracks) is smoothly
+inflated in proportion to how stationary recent IMU data looks, tracking the
+same GLRT statistic that drives the binary ZUPT/ZARU/tilt gate but without
+that gate's hysteresis. Added because touchdown bouncing/settling is an
+ambiguous middle ground the binary gate structurally can't react to quickly:
+real settling vibration keeps the instantaneous test from passing for a
+while after net translation is already ~0, and pushing the gate to trigger
+earlier by further tuning zupt_noise_inflation was tried and found to make
+things *worse* overall (see _update_stationary_state's docstring) via the
+self-referential-triangulation loop's sensitivity to exactly when that
+binary flip happens. Vision's trust doesn't need a firm yes/no the way
+asserting v=0 does, so it can fade continuously instead.
+
+The same GLRT statistic also softens ZUPT/ZARU/gravity-alignment themselves
+(the mirror image of 1c): each one's noise std is scaled up when the
+*current* instantaneous reading looks less confidently stationary than the
+hysteresis-latched _zupt_active flag implies (e.g. mid-blip, when hysteresis
+is bridging a brief burst of real-looking motion) -- so a correction applied
+while _zupt_active is only true because of hysteresis carries proportionally
+less weight than one applied while the signal actually looks quiet right now.
+
+A second trigger for _zupt_active comes from vision itself
+(_check_vision_zero_parallax, called from process_image): if every currently
+active feature track shows essentially no parallax (the same check_parallax
+test that gates triangulation quality, read here as "the camera hasn't
+translated meaningfully"), that's supporting evidence of stationarity from a
+completely different sensor. This can only ever force _zupt_active on, never
+off, and even then only when the IMU test isn't confidently reading "moving"
+(self._stationarity_ratio below zero_parallax_max_imu_ratio) -- it corroborates
+the IMU signal rather than overriding it. That gate is load-bearing, not
+cosmetic: checked directly against this dataset's real forward flight
+(~0.4-0.7 m/s), the *majority* of active tracks routinely show zero parallax
+simultaneously, because tracks near the camera's direction of travel (the
+focus of expansion) have bearing rays nearly parallel to the translation
+vector -- check_parallax's own documented blind spot (translation *along* a
+bearing ray is invisible to it) -- regardless of how fast the platform is
+actually moving. "All active tracks lack parallax" is therefore not, on its
+own, reliable evidence of stationarity for a forward-facing camera; it only
+becomes reliable once the IMU has already ruled out the "fast, low-rotation
+translation" explanation for the same symptom.
+
 An earlier version of this pipeline made max_clones a *soft* cap instead --
 letting the window grow (up to 3x) rather than force-process a still-active
 track early. That was found (via long-run divergence debugging) to be a
@@ -65,7 +107,7 @@ from measurement_model import null_space_project, stack_feature_observations
 from msckf_state import MSCKFState, augment, marginalize_clones, propagate
 from msckf_update import chi_square_threshold, ekf_update, gravity_alignment_update, passes_chi_square_gate, \
     zero_angular_rate_update, zero_velocity_update
-from triangulation import triangulate_and_validate, undistort_normalized
+from triangulation import check_parallax, triangulate_and_validate, undistort_normalized
 
 GRAVITY_MAGNITUDE = np.linalg.norm(GRAVITY_WORLD)
 
@@ -112,9 +154,34 @@ class MSCKFPipeline:
                  zaru_noise_std=1e-3,  # rad/s; ZUPT's rotational companion (see zero_angular_rate_update)
                  tilt_noise_std=1e-2,  # m/s^2; see gravity_alignment_update -- looser than
                                        # ZUPT/ZARU since "a=0" is only approximate under real vibration
-                 zupt_update_interval=0.05):  # s; corrections apply at most this often -- see
-                                               # process_imu's docstring for why detection and
-                                               # application run at different rates
+                 zupt_update_interval=0.05,  # s; corrections apply at most this often -- see
+                                              # process_imu's docstring for why detection and
+                                              # application run at different rates
+                 vision_trust_max_inflation=50.0,  # cap on how much _update_stationary_state can
+                                                    # inflate vision's observation noise std when
+                                                    # recent IMU excitation looks low -- see its
+                                                    # docstring. UNTUNED: a reasonable starting
+                                                    # order of magnitude (matches zupt_noise_inflation's
+                                                    # scale), not yet empirically swept the way that
+                                                    # parameter was.
+                 stationary_uncertainty_max_inflation=10.0,  # cap on how much ZUPT/ZARU/tilt's own
+                                                              # noise stds loosen when _zupt_active is
+                                                              # only true via hysteresis, not the current
+                                                              # instantaneous reading -- see docstring
+                                                              # below. Also UNTUNED.
+                 zero_parallax_min_tracks=5,  # minimum evaluable active tracks required before
+                                               # "all active tracks lack parallax" counts as
+                                               # evidence of stationarity -- see
+                                               # _check_vision_zero_parallax's docstring
+                 zero_parallax_max_imu_ratio=20.0):  # the vision zero-parallax signal can only
+                                                      # trigger _zupt_active while the IMU-side
+                                                      # stationarity_ratio is already below this --
+                                                      # see _check_vision_zero_parallax's docstring
+                                                      # for why this gate is load-bearing, not
+                                                      # optional. >4x margin below the ~70-150
+                                                      # ratios seen during real forward flight on
+                                                      # this dataset; still generous room above the
+                                                      # ~1-10 range seen approaching a real stop.
         self.state = MSCKFState.initialize(p0, v0, q0, b_g0, b_a0, P0)
         self.T_BS_cam0 = T_BS_cam0
         self.K = K
@@ -143,10 +210,17 @@ class MSCKFPipeline:
         self.zaru_noise_std = zaru_noise_std
         self.tilt_noise_std = tilt_noise_std
         self.zupt_update_interval = zupt_update_interval
+        self.vision_trust_max_inflation = vision_trust_max_inflation
+        self.stationary_uncertainty_max_inflation = stationary_uncertainty_max_inflation
+        self.zero_parallax_min_tracks = zero_parallax_min_tracks
+        self.zero_parallax_max_imu_ratio = zero_parallax_max_imu_ratio
         self._imu_history = deque(maxlen=zupt_window_samples)
         self._zupt_active = False
         self._zupt_hold_time = 0.0
         self._time_since_last_stationary_update = 0.0
+        self._vision_noise_scale = 1.0
+        self._stationary_uncertainty_scale = 1.0
+        self._stationarity_ratio = None
 
         self.tracker = FeatureTracker(max_features=max_features)
         self.clone_frame_ids = []       # clone_frame_ids[i] = timestamp of state.clone_positions[i]
@@ -190,10 +264,15 @@ class MSCKFPipeline:
         self._time_since_last_stationary_update += dt
         if self._zupt_active and self._time_since_last_stationary_update >= self.zupt_update_interval:
             self._time_since_last_stationary_update = 0.0
-            self.state = zero_velocity_update(self.state, self.zupt_noise_std, min_variance=self.min_variance)
-            self.state = zero_angular_rate_update(self.state, gyro, self.zaru_noise_std,
+            # softened by _stationary_uncertainty_scale (>1 whenever the *current* instantaneous
+            # reading looks less stationary than the hysteresis-latched flag implies) -- see
+            # _update_stationary_state's docstring
+            scale = self._stationary_uncertainty_scale
+            self.state = zero_velocity_update(self.state, self.zupt_noise_std * scale,
+                                               min_variance=self.min_variance)
+            self.state = zero_angular_rate_update(self.state, gyro, self.zaru_noise_std * scale,
                                                    min_variance=self.min_variance)
-            self.state = gravity_alignment_update(self.state, accel, self.tilt_noise_std,
+            self.state = gravity_alignment_update(self.state, accel, self.tilt_noise_std * scale,
                                                    min_variance=self.min_variance)
 
     def _update_stationary_state(self, dt):
@@ -262,6 +341,20 @@ class MSCKFPipeline:
         guarantee this generalizes to a different platform or IMU; recalibrate the same way
         if deploying elsewhere.
 
+        Tried pushing this to 30.0 to react faster through touchdown bouncing (still >1.5x
+        margin below the failure point) -- reverted. The detected active windows barely
+        moved (within ~0.1-0.2s of the 20.0 windows), but the 60s diagnostic's final position
+        error nearly doubled (22m vs 10.6m) and its 3-sigma escape point moved from t=51.6s
+        to t=17.6s, *before* the real landing even starts. Since the stationary-window timing
+        itself was nearly identical, the regression isn't really about this detector at all --
+        it's the downstream self-referential-triangulation feedback loop's known sensitivity
+        to small timing perturbations (see demo_full_pipeline.py's docstring) reacting badly
+        to a slightly different bias trajectory. A cautionary data point for tuning this
+        value by feel: a change that looks like a strict improvement on the metric it directly
+        targets (detection latency) can still make the overall filter worse through a
+        different, indirect mechanism -- always re-run the full diagnostic, not just the
+        detector's own sweep, before keeping a new value.
+
         Hysteresis: a real stationary period (e.g. landed, motors idling) can still have
         brief vibration blips that push the instantaneous test above threshold for a
         second or two. A first version without hysteresis flagged "moving" during one such
@@ -271,9 +364,66 @@ class MSCKFPipeline:
         zupt_hold_seconds of *continuous* (time-based, not a raw check count -- so this
         stays correct regardless of how often this method gets called) non-stationary
         readings before deactivating.
+
+        1c: this method also sets self._vision_noise_scale, a *continuous* multiplier on
+        vision's observation noise std (applied in _process_ready_tracks), separate from and
+        not hysteresis-gated like self._zupt_active. Motivation: ZUPT/ZARU/gravity-alignment
+        assert specific pseudo-measurements (v=0, omega=b_g, a=g), so they need a firm,
+        sticky yes/no decision -- there's no such thing as "50% asserting v=0". Vision's
+        trust, on the other hand, is already just a noise parameter, so it can track the
+        *current* excitation level immediately and smoothly instead of waiting for a
+        hysteresis-protected verdict. This targets the touchdown-bounce case specifically:
+        real settling vibration keeps the binary GLRT from firing for a while after net
+        translation is already ~0 (and pushing zupt_noise_inflation higher to force an
+        earlier binary trigger was tried and reverted -- see above -- since the downstream
+        self-referential-triangulation feedback loop turned out to be surprisingly sensitive
+        to exactly when that discrete flip happens). A continuous vision-trust scale
+        sidesteps needing that flip to happen at the "right" instant at all: during the
+        bounce, vision gets partially discounted in proportion to how quiet the IMU
+        currently looks, and by the time the binary detector does fire, vision has typically
+        already been mostly (not suddenly) sidelined.
+
+        Reuses the same GLRT statistic as the binary test rather than a separate heuristic:
+        stationarity_ratio = test_statistic / chi_square_threshold(...) is <1 exactly when
+        the instantaneous check would pass. self._vision_noise_scale is a Lorentzian-shaped
+        falloff in that ratio: 1 + (vision_trust_max_inflation - 1) / (1 + ratio^2) -- equal
+        to the max cap at ratio=0 (perfectly still) and decaying smoothly to 1.0 (no extra
+        distrust) as ratio grows, already bounded to [1, vision_trust_max_inflation] without
+        needing an explicit clip.
+
+        Deliberately *not* 1/ratio clipped to [1, max] (the first version of this, before it
+        was checked against real data): that formula only starts discounting once ratio is
+        already below 1 -- i.e. only once the instantaneous check would already pass --
+        which is exactly the same instant the binary gate fires, adding nothing beforehand.
+        Checked directly against this dataset's real touchdown: ratio descends through a real
+        gradient (~55 -> ~25 -> ~2.9 -> ~2.6 -> ~2.2 -> ~1.1) over about a second *before*
+        crossing 1.0, and during clearly-moving flight it typically sits at 10-800+ (median
+        ~110). Squaring ratio in the denominator keeps that typical-flight regime essentially
+        undiscounted (ratio=110 -> scale~1.004) while already meaningfully discounting by
+        ratio~3-6, roughly half a second to a second ahead of the binary trigger -- letting
+        vision fade out ahead of, not simultaneously with, that discrete flip.
+
+        This method also sets self._stationary_uncertainty_scale, the mirror image of
+        _vision_noise_scale applied to ZUPT/ZARU/gravity-alignment's own noise stds
+        (process_imu) instead of vision's. Motivation: self._zupt_active can be true purely
+        because hysteresis is bridging a brief blip (see above) while the *current*
+        instantaneous ratio actually looks like real motion -- in that moment, asserting
+        v=0/omega=b_g/a=g with full, undiscounted confidence is exactly backwards; those
+        pseudo-measurements should carry proportionally less weight the less the current
+        instant actually looks stationary, even while the sticky flag stays on. Same
+        underlying ratio, opposite shape from vision's: 1 + (stationary_uncertainty_max_inflation
+        - 1) * ratio^2/(1+ratio^2) -- 1.0 (no loosening) at ratio=0 (currently looks perfectly
+        still), growing toward the cap as ratio grows past 1 (currently looks like real
+        motion, hysteresis is doing all the work of keeping this active). Also naturally
+        bounded to [1, stationary_uncertainty_max_inflation] with no explicit clip needed.
+        UNTUNED -- added on the same reasoning as 1c but not yet checked against ground
+        truth the way zupt_noise_inflation and vision_trust_max_inflation's shape were.
         """
         if len(self._imu_history) < self._imu_history.maxlen:
             self._zupt_active = False
+            self._vision_noise_scale = 1.0
+            self._stationary_uncertainty_scale = 1.0
+            self._stationarity_ratio = None
             return
 
         window_size = len(self._imu_history)
@@ -293,7 +443,10 @@ class MSCKFPipeline:
         # dof: 6 raw scalars (3 gyro + 3 accel) per sample, minus 2 for the gravity
         # direction's 2 free parameters (a unit vector) estimated via ML from this same window
         dof = 6 * window_size - 2
-        instantaneous = test_statistic < chi_square_threshold(dof, self.zupt_confidence)
+        threshold = chi_square_threshold(dof, self.zupt_confidence)
+        stationarity_ratio = test_statistic / threshold
+        self._stationarity_ratio = stationarity_ratio
+        instantaneous = stationarity_ratio < 1.0
 
         if instantaneous:
             self._zupt_hold_time = 0.0
@@ -302,6 +455,72 @@ class MSCKFPipeline:
             self._zupt_hold_time += dt
             if self._zupt_hold_time > self.zupt_hold_seconds:
                 self._zupt_active = False
+
+        self._vision_noise_scale = 1.0 + (self.vision_trust_max_inflation - 1.0) / (1.0 + stationarity_ratio ** 2)
+        excitation = stationarity_ratio ** 2 / (1.0 + stationarity_ratio ** 2)
+        self._stationary_uncertainty_scale = 1.0 + (self.stationary_uncertainty_max_inflation - 1.0) * excitation
+
+    def _check_vision_zero_parallax(self):
+        """Secondary, vision-native trigger for self._zupt_active, corroborating (not
+        replacing) the IMU-only GLRT above: if every currently active feature track shows
+        essentially no parallax -- the same check_parallax test that gates triangulation
+        quality (triangulation.py), read here as "the camera hasn't translated meaningfully"
+        rather than "this feature isn't triangulable" -- that's supporting evidence of
+        stationarity from a completely different sensor. Runs once per camera frame (this is
+        inherently vision-rate; there's no camera data to check at IMU rate), right after
+        process_image tracks/augments, before it processes tracks for updates.
+
+        Two guards, both load-bearing (found necessary by checking this against real data,
+        not assumed up front):
+
+        1. Requires at least zero_parallax_min_tracks evaluable active tracks (an active
+           track with fewer than 2 observations in the known clone window can't be checked
+           at all). Below that, this stays silent rather than treating a near-empty active
+           set as evidence either way -- a tracker that's temporarily lost most of its
+           features is far more likely a tracking hiccup than a scene that stopped moving.
+
+        2. Requires self._stationarity_ratio (the IMU test's own statistic, from
+           _update_stationary_state) to already be below zero_parallax_max_imu_ratio --
+           i.e. the IMU isn't confidently reading "moving". Checked directly against this
+           dataset's real forward flight (~0.4-0.7 m/s) and found essential, not optional: a
+           *majority* of active tracks routinely read "no parallax" simultaneously during
+           ordinary forward motion, because tracks near the camera's direction of travel
+           (the focus of expansion) have bearing rays nearly parallel to the translation
+           vector -- check_parallax's own documented blind spot (translation *along* a
+           bearing ray is invisible to it), regardless of real speed. Without this guard,
+           the very first fast-forward-flight segment of a real run falsely triggered ZUPT.
+           The IMU ratio stayed reliably >60 throughout that same segment (vs. ~1-10
+           approaching a real stop), so requiring it below 20 filters out exactly this false-
+           positive class while leaving real, IMU-quiet approaches free to benefit.
+
+        Can only ever force self._zupt_active *on* (mirroring exactly what the IMU test's own
+        "instantaneous=True" branch does -- same _zupt_hold_time reset, so hysteresis behaves
+        identically regardless of which signal triggered it), never off: even with guard 2, a
+        parallax-only signal says nothing about rotation (a genuinely rotating-but-not-
+        translating platform could still pass this check while ZARU/gravity-alignment's "not
+        rotating" assumption is false), so it stays a one-directional corroboration, never an
+        override of the IMU test's "moving" verdict.
+        """
+        if self._stationarity_ratio is None or self._stationarity_ratio >= self.zero_parallax_max_imu_ratio:
+            return
+
+        clone_index_of = {t: i for i, t in enumerate(self.clone_frame_ids)}
+        evaluable = 0
+        for track_id in self.tracker.active_ids:
+            observations = [(t, uv) for t, uv in self.tracker.tracks[int(track_id)] if t in clone_index_of]
+            if len(observations) < 2:
+                continue
+            clone_indices = [clone_index_of[t] for t, _ in observations]
+            camera_poses = [(self.state.clone_orientations[i], self.state.clone_positions[i])
+                             for i in clone_indices]
+            bearings = [undistort_normalized([[u, v]], self.K, self.dist_coeffs)[0] for _, (u, v) in observations]
+            evaluable += 1
+            if check_parallax(camera_poses, bearings, self.min_parallax):
+                return  # at least one active track has real parallax -- not a parallax-frozen scene
+
+        if evaluable >= self.zero_parallax_min_tracks:
+            self._zupt_active = True
+            self._zupt_hold_time = 0.0
 
     def process_image(self, timestamp, image):
         """Track features, clone the current pose, use any now-ready tracks, then marginalize.
@@ -312,6 +531,9 @@ class MSCKFPipeline:
         self.tracker.process_frame(image, timestamp)
         self.state = augment(self.state, self.T_BS_cam0)
         self.clone_frame_ids.append(timestamp)
+
+        if self.enable_zupt:
+            self._check_vision_zero_parallax()
 
         just_ended = previously_active - set(self.tracker.active_ids.tolist())
 
@@ -338,6 +560,12 @@ class MSCKFPipeline:
 
     def _process_ready_tracks(self, just_ended, doomed_timestamps):
         clone_index_of = {t: i for i, t in enumerate(self.clone_frame_ids)}
+
+        # 1c: inflate vision's assumed noise (hence shrink its Kalman gain) in proportion to
+        # how stationary recent IMU data looks -- see _update_stationary_state's docstring.
+        # 1.0 when enable_zupt is off or recent motion looks clearly real; grows smoothly as
+        # the platform looks quieter, well before (and independent of) the binary ZUPT gate.
+        effective_noise_std = self.observation_noise_std * self._vision_noise_scale
 
         r_o_batch, H_o_batch = [], []
         n_rejected = 0
@@ -374,7 +602,7 @@ class MSCKFPipeline:
             if r_o is None:
                 continue
 
-            if passes_chi_square_gate(r_o, H_o, self.state.P, self.observation_noise_std, self.gate_confidence):
+            if passes_chi_square_gate(r_o, H_o, self.state.P, effective_noise_std, self.gate_confidence):
                 r_o_batch.append(r_o)
                 H_o_batch.append(H_o)
             else:
@@ -383,7 +611,7 @@ class MSCKFPipeline:
         n_updates = len(r_o_batch)
         if r_o_batch:
             self.state = ekf_update(self.state, np.concatenate(r_o_batch), np.concatenate(H_o_batch, axis=0),
-                                     self.observation_noise_std, min_variance=self.min_variance)
+                                     effective_noise_std, min_variance=self.min_variance)
         self.n_updates_applied += n_updates
         self.n_tracks_rejected += n_rejected
         return n_updates, n_rejected
