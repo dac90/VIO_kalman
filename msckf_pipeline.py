@@ -6,24 +6,81 @@ A feature's observation history is used in an EKF update when its track
 naturally ends (KLT stops tracking it) -- that's the common case, and it
 gets to use its whole accumulated history at once.
 
-Eviction defers to this: max_clones is a *soft* cap. A clone still
-referenced by a still-active track's unprocessed observations is not
-evicted; the window is simply allowed to grow a little until that track
-ends on its own. Without this, a long-lived track sitting right at the
-window's edge would get force-processed on every single subsequent frame
-with only ~1-2 new (low-parallax, largely useless) observations each time --
-repeatedly failing the chi-square gate and never contributing anything,
-while its early observations (its best baseline) are wasted piecemeal. A
-hard_max_clones safety valve still forces this in the rare case a track
-outlives it, so the window can't grow unboundedly.
+max_clones is a strict, always-enforced cap: the sliding window is
+marginalized back down to it every single frame, no exceptions. A still-
+active track whose oldest unprocessed observation is about to be evicted is
+force-processed with whatever it's accumulated so far (down to a bare
+minimum of 2 views), rather than losing that data outright.
+
+A trio of stationary-only pseudo-measurements -- ZUPT (zero-velocity),
+ZARU (zero angular-rate), and gravity/tilt alignment, all in msckf_update.py
+-- is applied whenever _update_stationary_state() detects the platform is at
+rest from raw IMU statistics. Found necessary after the user noticed (from
+the video demo) that this pipeline's residual long-run divergence began right
+when the drone in the test window lands and holds still: a stationary camera
+gets zero parallax on everything it sees, so vision updates go from merely
+unhelpful to actively harmful (the same self-referential triangulation
+problem below, but with no real corrective signal available at all to
+counteract it), while unaided dead-reckoning drifts on whatever residual bias
+remains. See _update_stationary_state's docstring for why this needs its own
+detector (fooled once by the filter's own drifting bias estimate already) and
+zero_velocity_update's docstring for why *that specific* update's mean
+correction is restricted to the velocity block only (fooled once by its own
+cross-correlation with gyro bias) -- ZARU and gravity-alignment don't need
+that restriction, since they measure bias/tilt directly rather than through a
+correlation, which is also why they were added: a bare ZUPT has no way to
+correct the residual accel bias actually driving the drift it's trying to
+stop, so position kept creeping even while ZUPT was firing correctly the
+whole time. Both this and the stationary detector itself now run once per
+IMU sample (200Hz) rather than once per camera frame (20Hz) as an earlier
+version did, since none of this depends on camera frames at all -- reacting
+to a stop up to 10x faster.
+
+An earlier version of this pipeline made max_clones a *soft* cap instead --
+letting the window grow (up to 3x) rather than force-process a still-active
+track early. That was found (via long-run divergence debugging) to be a
+significant net harm, not a fix: a longer window means features get
+triangulated against increasingly stale camera-pose estimates that have
+already drifted from truth, and Gauss-Newton refinement fits the feature to
+those poses by construction, giving a small, "consistent-looking" residual
+even when the poses themselves are wrong. The EKF update then reads as
+highly informative and shrinks P accordingly, reinforcing the existing
+drift instead of correcting it -- a self-fulfilling feedback loop that gets
+worse the longer the window is left to grow. A small, strictly bounded
+window (matching canonical MSCKF-VIO practice) starves that feedback loop of
+the staleness it needs; combined with triangulation.py's parallax and
+cheirality checks (which now handle the force-processed, thin-observation
+tracks that motivated the soft cap in the first place), this measured
+~25x lower position error at t=20s and pushed honest stable operation well
+past that mark in testing. See demos/demo_full_pipeline.py's docstring for
+current validated numbers.
 """
+from collections import deque
+
 import numpy as np
 
 from feature_tracker import FeatureTracker
+from imu_propagation import GRAVITY_WORLD
 from measurement_model import null_space_project, stack_feature_observations
 from msckf_state import MSCKFState, augment, marginalize_clones, propagate
-from msckf_update import ekf_update, passes_chi_square_gate
-from triangulation import triangulate_feature, undistort_normalized
+from msckf_update import chi_square_threshold, ekf_update, gravity_alignment_update, passes_chi_square_gate, \
+    zero_angular_rate_update, zero_velocity_update
+from triangulation import triangulate_and_validate, undistort_normalized
+
+GRAVITY_MAGNITUDE = np.linalg.norm(GRAVITY_WORLD)
+
+# Covariance floor (std, per IMU error-state block) -- see ekf_update's docstring
+# in msckf_update.py. Empirically swept (demos/demo_divergence_analysis.py) rather
+# than picked from first principles: values an order of magnitude looser than
+# these (closer to INITIAL_SIGMA/10) made the long-run divergence *worse*, not
+# better -- keeping P artificially open raises the Kalman gain for *every*
+# subsequent measurement, including the bad self-referential ones, so a floor
+# that's too generous makes the state more susceptible to corruption, not less.
+# These values (empirically ~0.4x that naive first guess) were the sweet spot
+# found by sweeping: they roughly halve position error at t=30s and cut it
+# ~5x at t=50s versus no floor at all, at the cost of a small (~0.5m) regression
+# at exactly t=20s. They don't eliminate eventual divergence past t~60s.
+DEFAULT_MIN_SIGMA = dict(theta=4e-4, b_g=4e-4, v=4e-3, b_a=4e-3, p=4e-4)
 
 
 class MSCKFPipeline:
@@ -34,22 +91,62 @@ class MSCKFPipeline:
     """
 
     def __init__(self, p0, v0, q0, b_g0, b_a0, P0, T_BS_cam0, K, dist_coeffs, noise_params,
-                 max_clones=20, hard_max_clones=None, max_features=150,
+                 max_clones=20, max_features=150,
                  observation_noise_std=5.0 / 458.0,  # ~5px: 1px was overconfident once triangulation
                                                       # uses the filter's own (imperfect) poses instead
                                                       # of ground truth -- see the divergence this caused
                                                       # when tuning this pipeline over long runs
-                 min_track_length=6, gate_confidence=0.95):
+                 min_track_length=6, gate_confidence=0.95,
+                 min_parallax=0.2,  # meters of camera translation orthogonal to a feature's
+                                    # bearing ray -- MSCKF-VIO's default; below this, depth
+                                    # along that ray is unobservable and triangulation is
+                                    # degenerate regardless of what the chi-square gate thinks
+                 max_reprojection_error=None,
+                 min_sigma=DEFAULT_MIN_SIGMA,  # covariance floor (std); pass None/{} to disable
+                 enable_zupt=True,
+                 zupt_window_samples=100,  # ~0.5s at the EuRoC IMU's 200Hz
+                 zupt_confidence=0.95,  # GLRT confidence -- see stationary-detector docstring below
+                 zupt_noise_inflation=20.0,  # empirically tuned -- see docstring below
+                 zupt_hold_seconds=2.0,  # continuous non-stationary time needed to exit ZUPT
+                 zupt_noise_std=1e-3,  # m/s; tight, since a detected-stationary period is high-confidence
+                 zaru_noise_std=1e-3,  # rad/s; ZUPT's rotational companion (see zero_angular_rate_update)
+                 tilt_noise_std=1e-2,  # m/s^2; see gravity_alignment_update -- looser than
+                                       # ZUPT/ZARU since "a=0" is only approximate under real vibration
+                 zupt_update_interval=0.05):  # s; corrections apply at most this often -- see
+                                               # process_imu's docstring for why detection and
+                                               # application run at different rates
         self.state = MSCKFState.initialize(p0, v0, q0, b_g0, b_a0, P0)
         self.T_BS_cam0 = T_BS_cam0
         self.K = K
         self.dist_coeffs = dist_coeffs
         self.noise_params = noise_params
         self.max_clones = max_clones
-        self.hard_max_clones = hard_max_clones if hard_max_clones is not None else max_clones * 3
         self.observation_noise_std = observation_noise_std
         self.min_track_length = min_track_length
         self.gate_confidence = gate_confidence
+        self.min_parallax = min_parallax
+        # a fixed (P-independent) sanity bound on post-refinement reprojection error, in
+        # normalized bearing units -- default is a generous multiple of the assumed
+        # observation noise, just to catch triangulations that clearly didn't converge
+        self.max_reprojection_error = (max_reprojection_error if max_reprojection_error is not None
+                                        else 5.0 * observation_noise_std)
+        self.min_variance = (np.array([min_sigma["theta"] ** 2] * 3 + [min_sigma["b_g"] ** 2] * 3
+                                       + [min_sigma["v"] ** 2] * 3 + [min_sigma["b_a"] ** 2] * 3
+                                       + [min_sigma["p"] ** 2] * 3)
+                              if min_sigma else None)
+
+        self.enable_zupt = enable_zupt
+        self.zupt_confidence = zupt_confidence
+        self.zupt_noise_inflation = zupt_noise_inflation
+        self.zupt_hold_seconds = zupt_hold_seconds
+        self.zupt_noise_std = zupt_noise_std
+        self.zaru_noise_std = zaru_noise_std
+        self.tilt_noise_std = tilt_noise_std
+        self.zupt_update_interval = zupt_update_interval
+        self._imu_history = deque(maxlen=zupt_window_samples)
+        self._zupt_active = False
+        self._zupt_hold_time = 0.0
+        self._time_since_last_stationary_update = 0.0
 
         self.tracker = FeatureTracker(max_features=max_features)
         self.clone_frame_ids = []       # clone_frame_ids[i] = timestamp of state.clone_positions[i]
@@ -65,7 +162,146 @@ class MSCKFPipeline:
         self.n_tracks_rejected = 0
 
     def process_imu(self, gyro, accel, dt):
+        """Propagate, then (if enabled) update stationarity detection and, if warranted,
+        apply the stationary-period corrections.
+
+        Detection (_update_stationary_state) runs every IMU sample (200Hz on this
+        dataset) so a stop gets *noticed* as fast as possible. Applying the corrections
+        themselves at that same rate turned out to be actively harmful, though: consecutive
+        accelerometer/gyro samples 5ms apart are not independent draws (real sensor noise
+        and real vibration are correlated over such short gaps), so treating ~200
+        corrections a second as that many independent fresh measurements manufactures far
+        more confidence than the data actually supports -- a real incident on this dataset
+        had this collapse P so hard that a small theta/b_a estimation ambiguity inherent to
+        gravity_alignment_update (a small tilt error and a small accel-bias error affect the
+        predicted reading almost identically) got "locked in" wrong and then compounded for
+        the ~24s of the stationary hold, leaving accel bias error 10x worse than before this
+        fix and the subsequent resumed-motion phase catastrophically worse than with no
+        stationary corrections at all. Applying the corrections themselves at a bounded rate
+        (zupt_update_interval, default 20Hz -- the same cadence validated before detection
+        was moved to IMU rate) avoids that overcounting while keeping the fast reaction time.
+        """
         self.state = propagate(self.state, gyro, accel, dt, self.noise_params)
+        if not self.enable_zupt:
+            return
+        self._imu_history.append((np.asarray(gyro), np.asarray(accel)))
+        self._update_stationary_state(dt)
+
+        self._time_since_last_stationary_update += dt
+        if self._zupt_active and self._time_since_last_stationary_update >= self.zupt_update_interval:
+            self._time_since_last_stationary_update = 0.0
+            self.state = zero_velocity_update(self.state, self.zupt_noise_std, min_variance=self.min_variance)
+            self.state = zero_angular_rate_update(self.state, gyro, self.zaru_noise_std,
+                                                   min_variance=self.min_variance)
+            self.state = gravity_alignment_update(self.state, accel, self.tilt_noise_std,
+                                                   min_variance=self.min_variance)
+
+    def _update_stationary_state(self, dt):
+        """Update self._zupt_active using a GLRT (generalized likelihood-ratio test) on raw
+        IMU statistics -- deliberately independent of the filter's own pose/velocity estimate
+        (unlike triangulation.py's parallax check, which uses the filter's *own* camera-clone
+        poses and so can be fooled: once the filter has accumulated some drift, it can
+        believe a stationary scene has real parallax, since its own poses appear to have
+        moved even though the camera never did). Called once per IMU sample (200Hz on this
+        dataset), not once per camera frame (20Hz) as an earlier version did -- detecting and
+        reacting to a stop up to 10x faster, since ZUPT/ZARU/gravity-alignment are pure
+        IMU-side corrections with no dependency on camera frames at all.
+
+        This is the SHOE ("stance hypothesis optimal estimation") detector from Skog et al.,
+        "Zero-Velocity Detection -- An Algorithm Evaluation" (IEEE Trans. Biomedical
+        Engineering, 2010) -- standard in ZUPT-aided INS -- rather than a hand-tuned
+        threshold on the raw signal's mean/variance (an earlier version of this method used
+        exactly that, and it worked, but every threshold was picked by eyeballing this one
+        dataset's numbers with no principled way to know if they'd generalize). The GLRT
+        compares two hypotheses per window: H0 (stationary: gyro reads pure noise, accel
+        reads gravity from a fixed but unknown direction) vs H1 (moving: no such structure).
+        Under H0, each raw residual, normalized by the IMU's own characterized noise density
+        (self.noise_params, discretized as density^2/dt), is approximately a unit-variance
+        Gaussian, so the summed squared residuals over the window are approximately
+        chi-square distributed -- letting the existing chi_square_threshold utility (already
+        used for vision-outlier gating) supply a single principled zupt_confidence parameter
+        in place of three separately hand-tuned magic numbers.
+
+        Two adaptations from the textbook SHOE detector, both because this IMU's biases are
+        too large to ignore (unlike the noise-only model the original derivation assumes):
+        gyro readings are corrected by the filter's own b_g estimate before testing (raw
+        gyro is dominated by a ~0.08 rad/s constant bias here -- without this correction, a
+        brief window of smooth, low-variance flight reads as falsely "stationary", since a
+        real but steady rotation rate is easily mistaken for bias); accel readings are
+        similarly corrected by b_a. The gravity *direction* itself is still estimated fresh
+        from each window's own mean (the textbook approach) rather than from the filter's
+        orientation estimate, specifically to avoid the same self-referential trap the
+        parallax check has -- this detector shouldn't need to trust the filter's own
+        attitude belief to work.
+
+        zupt_noise_inflation exists because the manufacturer's noise-density spec
+        (self.noise_params, from imu0/sensor.yaml) is an idealized white-noise number that
+        real sensor data doesn't actually live up to -- checked directly on this dataset: the
+        raw test statistic during a period ground truth confirms is genuinely stationary came
+        out 1x-17x *larger* than chi_square_threshold at zupt_confidence=0.95 using the
+        noise density as-is (residual bias-correction error, real mounting vibration even at
+        rest, and non-white noise all inflate real variance beyond the datasheet number, and
+        none of that is specific to this sensor -- it's a standard, documented gap in
+        ZUPT/SHOE deployments generally, not a derivation error here).
+
+        The default of 20.0 was empirically tuned against ground truth (the only labeled
+        stationary/moving data available here): swept 1-50, using ground-truth velocity to
+        label every IMU sample as truly stationary (|v|<0.02 m/s) or clearly moving
+        (|v|>0.1 m/s), and running the full pipeline once per candidate value. Below ~5, the
+        detector never fires at all (too strict to ever accept real IMU data as "noise
+        only"). From 5 up through 45, it never once fires during genuine motion anywhere in
+        a 60s window spanning real flight, landing, the ~24s hold, and the resumed takeoff,
+        while detection latency at the real stationary onset improves only marginally with
+        further inflation (20.4s at 5, down to 18.7s at 45 -- most of that gain is already
+        captured by 20). At 50, it starts firing during the early takeoff ramp (t=42.2s,
+        true |v|=0.10 m/s) -- a real false positive, actively harmful, since it would apply
+        ZUPT/ZARU/gravity-alignment against a platform that's actually accelerating. 20.0
+        sits at the "elbow" of the latency-vs-margin tradeoff: essentially all the reachable
+        latency improvement, with better than 2x margin below the observed failure point.
+        This is one dataset with one real stationary event, though -- it's evidence, not a
+        guarantee this generalizes to a different platform or IMU; recalibrate the same way
+        if deploying elsewhere.
+
+        Hysteresis: a real stationary period (e.g. landed, motors idling) can still have
+        brief vibration blips that push the instantaneous test above threshold for a
+        second or two. A first version without hysteresis flagged "moving" during one such
+        blip and never went back to "stationary" until real motion actually resumed tens of
+        seconds later -- reopening exactly the self-referential vision divergence this
+        detector exists to prevent, for that whole gap. Once active, ZUPT now requires
+        zupt_hold_seconds of *continuous* (time-based, not a raw check count -- so this
+        stays correct regardless of how often this method gets called) non-stationary
+        readings before deactivating.
+        """
+        if len(self._imu_history) < self._imu_history.maxlen:
+            self._zupt_active = False
+            return
+
+        window_size = len(self._imu_history)
+        gyro_hist = np.array([g for g, _ in self._imu_history]) - self.state.b_g
+        accel_hist = np.array([a for _, a in self._imu_history]) - self.state.b_a
+
+        accel_mean = accel_hist.mean(axis=0)
+        gravity_direction = accel_mean / np.linalg.norm(accel_mean)
+        accel_reference = GRAVITY_MAGNITUDE * gravity_direction
+
+        # continuous-time noise density -> discrete per-sample variance: sigma^2 = density^2/dt
+        sigma_gyro_sq = self.noise_params["gyro_noise"] ** 2 / dt * self.zupt_noise_inflation
+        sigma_accel_sq = self.noise_params["accel_noise"] ** 2 / dt * self.zupt_noise_inflation
+
+        test_statistic = (np.sum(gyro_hist ** 2) / sigma_gyro_sq
+                           + np.sum((accel_hist - accel_reference) ** 2) / sigma_accel_sq)
+        # dof: 6 raw scalars (3 gyro + 3 accel) per sample, minus 2 for the gravity
+        # direction's 2 free parameters (a unit vector) estimated via ML from this same window
+        dof = 6 * window_size - 2
+        instantaneous = test_statistic < chi_square_threshold(dof, self.zupt_confidence)
+
+        if instantaneous:
+            self._zupt_hold_time = 0.0
+            self._zupt_active = True
+        elif self._zupt_active:
+            self._zupt_hold_time += dt
+            if self._zupt_hold_time > self.zupt_hold_seconds:
+                self._zupt_active = False
 
     def process_image(self, timestamp, image):
         """Track features, clone the current pose, use any now-ready tracks, then marginalize.
@@ -79,7 +315,7 @@ class MSCKFPipeline:
 
         just_ended = previously_active - set(self.tracker.active_ids.tolist())
 
-        n_to_evict = self._n_safe_to_evict()
+        n_to_evict = max(0, self.state.n_clones - self.max_clones)
         doomed_timestamps = set(self.clone_frame_ids[:n_to_evict]) if n_to_evict > 0 else set()
 
         n_updates, n_rejected = self._process_ready_tracks(just_ended, doomed_timestamps)
@@ -92,35 +328,6 @@ class MSCKFPipeline:
             self.clone_frame_ids = self.clone_frame_ids[n_to_evict:]
 
         return n_updates, n_rejected
-
-    def _n_safe_to_evict(self):
-        """How many of the oldest clones can be dropped right now.
-
-        Normally, that's every clone past max_clones except ones a
-        still-active track has an unprocessed observation at -- those are
-        left alone (growing the window) until that track ends naturally.
-        If a track's longevity would grow the window past hard_max_clones,
-        this forces eviction anyway; _process_ready_tracks then has to use
-        whatever that track has accumulated so far, however little.
-        """
-        target = self.state.n_clones - self.max_clones
-        if target <= 0:
-            return 0
-
-        referenced = set()
-        for track_id in self.tracker.active_ids.tolist():
-            already_used = self._n_used_observations.get(track_id, 0)
-            for t, _ in self.tracker.tracks[track_id][already_used:]:
-                referenced.add(t)
-
-        n_safe = 0
-        for t in self.clone_frame_ids[:target]:
-            if t in referenced:
-                break
-            n_safe += 1
-
-        n_forced = self.state.n_clones - self.hard_max_clones
-        return max(n_safe, n_forced)
 
     def full_trajectory(self):
         """(timestamps, positions, orientations) for every clone ever created, marginalized or still active."""
@@ -176,7 +383,7 @@ class MSCKFPipeline:
         n_updates = len(r_o_batch)
         if r_o_batch:
             self.state = ekf_update(self.state, np.concatenate(r_o_batch), np.concatenate(H_o_batch, axis=0),
-                                     self.observation_noise_std)
+                                     self.observation_noise_std, min_variance=self.min_variance)
         self.n_updates_applied += n_updates
         self.n_tracks_rejected += n_rejected
         return n_updates, n_rejected
@@ -186,10 +393,13 @@ class MSCKFPipeline:
         camera_poses = [(self.state.clone_orientations[i], self.state.clone_positions[i]) for i in clone_indices]
         bearings = [undistort_normalized([[u, v]], self.K, self.dist_coeffs)[0] for _, (u, v) in usable]
         try:
-            X_est = triangulate_feature(camera_poses, bearings)
+            X_est = triangulate_and_validate(camera_poses, bearings, self.min_parallax,
+                                              self.max_reprojection_error)
+            if X_est is None:
+                return None, None
             r, H_x, H_f = stack_feature_observations(X_est, camera_poses, bearings, clone_indices,
                                                       n_clones=self.state.n_clones)
             return null_space_project(r, H_x, H_f)
         except np.linalg.LinAlgError:
-            # degenerate geometry (e.g. near-zero parallax); no parallax check yet (deferred earlier)
+            # degenerate geometry the SVD/QR itself couldn't handle
             return None, None

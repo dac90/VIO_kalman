@@ -222,3 +222,6 @@ machine_hall/
 
 # Generated demo videos (large, fully reproducible via demos/demo_full_pipeline_video.py)
 demos/*.mp4
+
+# Generated demo plots (fully reproducible via their respective demo scripts)
+demos/*.png

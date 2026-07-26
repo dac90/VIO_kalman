@@ -59,10 +59,9 @@ def _run_pipeline(duration_s, max_clones=15, bias_gyro=None, bias_accel=None):
 
         pipeline.process_image(frame_t, image)
 
-        # max_clones is a *soft* cap (a clone still referenced by an active
-        # track is kept rather than evicted -- see msckf_pipeline.py); only
-        # hard_max_clones is a true, always-enforced upper bound
-        assert pipeline.state.n_clones <= pipeline.hard_max_clones
+        # max_clones is a strict, always-enforced upper bound (see msckf_pipeline.py --
+        # an earlier soft-cap version that let this grow was found to cause long-run divergence)
+        assert pipeline.state.n_clones <= pipeline.max_clones
         expected_dim = N_IMU_ERROR + N_CLONE_ERROR * pipeline.state.n_clones
         assert pipeline.state.P.shape == (expected_dim, expected_dim)
         assert len(pipeline.clone_frame_ids) == pipeline.state.n_clones
@@ -72,14 +71,215 @@ def _run_pipeline(duration_s, max_clones=15, bias_gyro=None, bias_accel=None):
     return pipeline, frames, n_clones_history
 
 
+def _minimal_pipeline(b_g0=None, **kwargs):
+    """A pipeline with no camera frames processed yet -- for testing process_imu-only
+    behavior (like the ZUPT stationary detector) without needing real image data."""
+    K, dist_coeffs = load_cam0_intrinsics()
+    T_BS_cam0 = load_T_BS(f"{gt.MAV0_DIR}/cam0/sensor.yaml")
+    noise_params = load_imu_noise_params()
+    return MSCKFPipeline(np.zeros(3), np.zeros(3), np.array([1.0, 0, 0, 0]),
+                          b_g0 if b_g0 is not None else np.zeros(3), np.zeros(3),
+                          _initial_covariance(), T_BS_cam0, K, dist_coeffs, noise_params, **kwargs)
+
+
+def test_is_stationary_false_until_the_imu_history_buffer_fills():
+    pipeline = _minimal_pipeline(zupt_window_samples=10)
+    gravity = np.array([0.0, 0.0, 9.81])
+    for _ in range(9):
+        pipeline.process_imu(np.zeros(3), gravity, 0.005)
+    assert not pipeline._zupt_active  # buffer not full yet, regardless of how still the IMU looks
+
+
+def test_is_stationary_distinguishes_a_still_imu_from_a_moving_one():
+    rng = np.random.default_rng(0)
+    gravity = np.array([0.0, 0.0, 9.81])
+
+    still_pipeline = _minimal_pipeline(zupt_window_samples=50)
+    for _ in range(50):
+        still_pipeline.process_imu(rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+    assert still_pipeline._zupt_active
+
+    moving_pipeline = _minimal_pipeline(zupt_window_samples=50)
+    for i in range(50):
+        moving_pipeline.process_imu(np.array([0.3, 0.0, 0.0]) * np.sin(i * 0.3),
+                                     gravity + np.array([1.5, 0.5, 0.0]) * np.cos(i * 0.3), 0.005)
+    assert not moving_pipeline._zupt_active
+
+
+def test_stationary_detector_scales_with_declared_imu_noise_density():
+    # the whole point of the GLRT stationary detector (1b) over the hand-tuned thresholds
+    # it replaced: the same borderline signal should be judged differently depending on how
+    # precise the IMU actually is, since the test is normalized by noise_params rather than
+    # a fixed magic number. A small constant gyro offset that's way beyond a *tight*-noise
+    # sensor's precision (so it reads as real signal, not noise) should be well within a
+    # *loose*-noise sensor's precision (so the identical data reads as just noise).
+    gravity = np.array([0.0, 0.0, 9.81])
+    small_offset = np.array([0.01, 0.0, 0.0])
+
+    def _pipeline_with_gyro_noise(gyro_noise_density):
+        K, dist_coeffs = load_cam0_intrinsics()
+        T_BS_cam0 = load_T_BS(f"{gt.MAV0_DIR}/cam0/sensor.yaml")
+        noise_params = dict(load_imu_noise_params())
+        noise_params["gyro_noise"] = gyro_noise_density
+        return MSCKFPipeline(np.zeros(3), np.zeros(3), np.array([1.0, 0, 0, 0]), np.zeros(3), np.zeros(3),
+                              _initial_covariance(), T_BS_cam0, K, dist_coeffs, noise_params,
+                              zupt_window_samples=50)
+
+    tight_pipeline = _pipeline_with_gyro_noise(1e-5)  # much more precise than small_offset
+    loose_pipeline = _pipeline_with_gyro_noise(1e-1)  # much less precise than small_offset
+    for i in range(50):
+        rng = np.random.default_rng(4 * 1000 + i)  # same per-step realization for both pipelines
+        gyro_sample = small_offset + rng.normal(size=3) * 1e-5
+        accel_sample = gravity + rng.normal(size=3) * 1e-4
+        tight_pipeline.process_imu(gyro_sample, accel_sample, 0.005)
+        loose_pipeline.process_imu(gyro_sample, accel_sample, 0.005)
+
+    assert not tight_pipeline._zupt_active  # too precise a sensor to call this "just noise"
+    assert loose_pipeline._zupt_active      # too imprecise a sensor to tell this from noise
+
+
+def test_is_stationary_survives_a_brief_vibration_blip_via_hysteresis():
+    # a still-landed platform can have a second or two of vibration/motor noise that
+    # briefly pushes the instantaneous test above threshold -- shouldn't immediately
+    # cancel ZUPT, since the platform hasn't actually started moving (see
+    # msckf_pipeline.py's _update_stationary_state docstring for the real-data incident
+    # this guards against: a brief blip previously caused ZUPT to stay off for ~13s of
+    # genuine continued stationarity, reopening the divergence it exists to prevent).
+    # Note: because the instantaneous test itself looks at a sliding window (not just the
+    # latest sample), a blip's effect lingers in that window for up to zupt_window_samples
+    # more samples after the blip itself ends -- so zupt_hold_seconds needs real margin
+    # over the window's own time span, not just over the blip's duration, matching the
+    # ~4x ratio used in MSCKFPipeline's real defaults (window=100 samples=0.5s, hold=2.0s).
+    rng = np.random.default_rng(1)
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50, zupt_hold_seconds=0.5)
+
+    for _ in range(50):
+        pipeline.process_imu(rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+    assert pipeline._zupt_active
+
+    # a short blip: 5 samples of real-looking motion
+    for _ in range(5):
+        pipeline.process_imu(np.array([0.3, 0.0, 0.0]), gravity + np.array([1.0, 0.0, 0.0]), 0.005)
+        assert pipeline._zupt_active  # hysteresis should hold it active through the blip
+
+    # settles back down -- more than a full window's worth of samples, so the blip has
+    # fully aged out of the sliding window by the end -- should still read as stationary
+    for _ in range(60):
+        pipeline.process_imu(rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+    assert pipeline._zupt_active
+
+
+def test_is_stationary_eventually_deactivates_after_sustained_real_motion():
+    rng = np.random.default_rng(2)
+    gravity = np.array([0.0, 0.0, 9.81])
+    pipeline = _minimal_pipeline(zupt_window_samples=50, zupt_hold_seconds=0.5)
+
+    for _ in range(50):
+        pipeline.process_imu(rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+    assert pipeline._zupt_active
+
+    # sustained, *time-varying* real motion -- not a constant reading, which ZARU could
+    # (correctly, given its own model) start explaining away as an updated bias estimate,
+    # since a perfectly constant reading is fundamentally indistinguishable from bias by
+    # design -- for longer than zupt_hold_seconds, should eventually deactivate
+    became_inactive = False
+    for i in range(150):
+        gyro = np.array([0.3, 0.0, 0.0]) * np.sin(i * 0.3)
+        accel = gravity + np.array([1.5, 0.5, 0.0]) * np.cos(i * 0.3)
+        pipeline.process_imu(gyro, accel, 0.005)
+        if not pipeline._zupt_active:
+            became_inactive = True
+            break
+    assert became_inactive
+
+
+def test_is_stationary_disabled_when_enable_zupt_is_false():
+    pipeline = _minimal_pipeline(enable_zupt=False, zupt_window_samples=5)
+    gravity = np.array([0.0, 0.0, 9.81])
+    for _ in range(20):
+        pipeline.process_imu(np.zeros(3), gravity, 0.005)
+    assert not pipeline._zupt_active
+
+
+def test_stationary_pipeline_corrects_gyro_bias_via_zaru_with_no_vision_at_all():
+    # a slightly-wrong initial gyro-bias guess, fed a genuinely still IMU signal (true bias
+    # = true_bias, zero real rotation) -- ZARU should pull b_g further toward true_bias
+    # purely from process_imu, with process_image never called (no vision, no clones,
+    # nothing). The mismatch here is deliberately small (~0.003 rad/s), not the ~0.02-0.03
+    # rad/s an earlier version of this test used: with the GLRT stationary detector (1b),
+    # a mismatch that large relative to this sensor's real, tight noise floor is -- rightly
+    # -- statistically indistinguishable from genuine rotation, so the detector correctly
+    # refuses to call it "stationary" until the estimate is already reasonably close, same
+    # fundamental ambiguity noted for ZARU itself (it can't tell "wrong bias" from "real
+    # constant rotation" from gyro data alone).
+    rng = np.random.default_rng(3)
+    gravity = np.array([0.0, 0.0, 9.81])
+    true_bias = np.array([0.02, -0.01, 0.03])
+    wrong_bias_guess = true_bias - np.array([0.002, -0.001, 0.0015])
+
+    pipeline = _minimal_pipeline(b_g0=wrong_bias_guess, zupt_window_samples=50)
+    for _ in range(200):
+        pipeline.process_imu(true_bias + rng.normal(size=3) * 1e-4, gravity + rng.normal(size=3) * 1e-4, 0.005)
+
+    assert pipeline._zupt_active
+    assert np.linalg.norm(pipeline.state.b_g - true_bias) < np.linalg.norm(wrong_bias_guess - true_bias)
+
+
+def test_tuned_zupt_noise_inflation_has_no_false_positives_on_real_data():
+    # regression guard for the empirically-tuned zupt_noise_inflation default (see
+    # msckf_pipeline.py's _update_stationary_state docstring for the full sweep this came
+    # from): over a real window spanning flight, landing, the ~24s stationary hold, and the
+    # resumed takeoff, the detector must never fire during genuine motion -- a false
+    # positive there means applying ZUPT/ZARU/gravity-alignment against a platform that's
+    # actually moving, which actively corrupts the state, a strictly worse failure mode
+    # than detecting a real stop a bit late -- and it must actually detect the real
+    # stationary segment, not just stay silent the whole time.
+    K, dist_coeffs = load_cam0_intrinsics()
+    T_BS_cam0 = load_T_BS(f"{gt.MAV0_DIR}/cam0/sensor.yaml")
+    noise_params = load_imu_noise_params()
+
+    duration_s = 45.0
+    gt_timestamps, _, _, _ = gt._load_state_ground_truth()
+    cam0_all_timestamps = gt.load_cam0_timestamps()
+    start_frame = int(np.searchsorted(cam0_all_timestamps, gt_timestamps[0])) + 30
+    n_frames = int(duration_s * 20)
+    frames = list(iter_cam0_frames(max_frames=n_frames, start_frame=start_frame))
+    t0 = frames[0][0]
+    p0 = gt.interpolate_ground_truth_position(t0)
+    v0 = gt.interpolate_ground_truth_velocity(t0)
+    q0 = gt.interpolate_ground_truth_orientation(t0)
+
+    pipeline = MSCKFPipeline(p0, v0, q0, DUMMY_BIAS_GYRO, DUMMY_BIAS_ACCEL, _initial_covariance(),
+                              T_BS_cam0, K, dist_coeffs, noise_params)
+
+    imu_timestamps, gyro, accel = _load_imu_measurements()
+    imu_idx = np.searchsorted(imu_timestamps, t0, side="right")
+    t_prev = t0
+    ever_detected_real_stationary = False
+    for frame_t, image in frames:
+        while imu_idx < len(imu_timestamps) and imu_timestamps[imu_idx] <= frame_t:
+            t_curr = int(imu_timestamps[imu_idx])
+            pipeline.process_imu(gyro[imu_idx], accel[imu_idx], (t_curr - t_prev) / 1e9)
+            t_prev = t_curr
+            imu_idx += 1
+            v_gt_norm = np.linalg.norm(gt.interpolate_ground_truth_velocity(t_curr))
+            if pipeline._zupt_active:
+                assert v_gt_norm < 0.1, (f"ZUPT falsely active while genuinely moving "
+                                          f"(|v_gt|={v_gt_norm:.3f} m/s) at t={(t_curr - t0) / 1e9:.2f}s")
+                if v_gt_norm < 0.02:
+                    ever_detected_real_stationary = True
+        pipeline.process_image(frame_t, image)
+
+    assert ever_detected_real_stationary
+
+
 def test_window_stays_bounded_and_covariance_stays_healthy():
     max_clones = 12
     pipeline, _, n_clones_history = _run_pipeline(10.0, max_clones=max_clones,
                                                    bias_gyro=DUMMY_BIAS_GYRO, bias_accel=DUMMY_BIAS_ACCEL)
 
-    # soft cap: usually at or near max_clones, but may run a bit over while
-    # an active track keeps an old clone alive -- hard_max_clones is the real bound
-    assert max(n_clones_history) <= pipeline.hard_max_clones
+    assert max(n_clones_history) <= max_clones  # strict cap: never exceeded
     assert n_clones_history[-1] >= max_clones  # should have filled up over 10s, not stayed emptier
 
     eigenvalues = np.linalg.eigvalsh(pipeline.state.P)

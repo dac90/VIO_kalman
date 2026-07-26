@@ -117,3 +117,68 @@ def triangulate_feature(camera_poses, bearings, n_iters=10):
     """Linear (DLT) initialization followed by Gauss-Newton refinement. Returns the world-frame point."""
     X_init = linear_triangulate(camera_poses, bearings)
     return refine_triangulation(X_init, camera_poses, bearings, n_iters=n_iters)
+
+
+def check_parallax(camera_poses, bearings, min_orthogonal_translation=0.2):
+    """True if there's enough triangulation-observable baseline between the first and last
+    observing camera pose (matches MSCKF-VIO's Feature::checkMotion).
+
+    Pure translation *along* the feature's initial bearing ray gives zero parallax -- depth
+    along that ray stays unobservable no matter how far the camera travels -- so only the
+    translation component orthogonal to the ray counts as usable baseline.
+    """
+    (q_first, p_first) = camera_poses[0]
+    (_, p_last) = camera_poses[-1]
+
+    x, y = bearings[0]
+    ray_cam = np.array([x, y, 1.0])
+    ray_cam = ray_cam / np.linalg.norm(ray_cam)
+    ray_world = quaternion_to_rotation_matrix(q_first) @ ray_cam
+
+    translation = p_last - p_first
+    parallel = np.dot(translation, ray_world) * ray_world
+    orthogonal = translation - parallel
+    return np.linalg.norm(orthogonal) > min_orthogonal_translation
+
+
+def check_cheirality(X_world, camera_poses):
+    """True if the triangulated point is in front of every observing camera (positive depth).
+
+    A linear (DLT) + Gauss-Newton solution isn't constrained to end up in front of every
+    camera -- near-degenerate geometry can converge to a point behind one, which is an
+    unambiguous sign the solution is wrong regardless of how small its reprojection
+    residual happens to look.
+    """
+    for q_world_cam, p_world_cam in camera_poses:
+        _, Xc = _project(X_world, q_world_cam, p_world_cam)
+        if Xc[2] <= 0:
+            return False
+    return True
+
+
+def triangulate_and_validate(camera_poses, bearings, min_orthogonal_translation=0.2,
+                              max_reprojection_error=None, n_iters=10):
+    """triangulate_feature, but returns None instead of a point for degenerate geometry.
+
+    Three checks, all independent of the filter's own covariance P (unlike the chi-square
+    gate in msckf_update.py, whose threshold scales with P -- so once P is even a little
+    too large, a bad point can still pass it, adding more error, growing P further, and so
+    on): insufficient parallax (check_parallax), a solution that ends up behind a camera
+    (check_cheirality), and -- if max_reprojection_error is given -- a refined reprojection
+    error too large to trust even though the first two checks passed.
+    """
+    if not check_parallax(camera_poses, bearings, min_orthogonal_translation):
+        return None
+
+    X_init = linear_triangulate(camera_poses, bearings)
+    X_world = refine_triangulation(X_init, camera_poses, bearings, n_iters=n_iters)
+
+    if not check_cheirality(X_world, camera_poses):
+        return None
+
+    if max_reprojection_error is not None:
+        residuals = reprojection_residuals(X_world, camera_poses, bearings).reshape(-1, 2)
+        if np.max(np.linalg.norm(residuals, axis=1)) > max_reprojection_error:
+            return None
+
+    return X_world

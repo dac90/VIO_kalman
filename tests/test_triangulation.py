@@ -5,10 +5,13 @@ from feature_tracker import FeatureTracker, iter_cam0_frames
 from frames import body_to_sensor_position, load_T_BS
 from quaternion_utils import axis_angle_to_quat, quat_conjugate, rotate_vector_by_quaternion
 from triangulation import (
+    check_cheirality,
+    check_parallax,
     linear_triangulate,
     load_cam0_intrinsics,
     refine_triangulation,
     reprojection_residuals,
+    triangulate_and_validate,
     triangulate_feature,
     undistort_normalized,
 )
@@ -131,3 +134,73 @@ def test_triangulate_real_track_gives_plausible_positive_depth():
         Xc = rotate_vector_by_quaternion(q_world_cam_conj, X_world - p_cam)
         assert Xc[2] > 0, "triangulated point ended up behind a camera that observed it"
         assert 0.1 < Xc[2] < 50.0, f"depth {Xc[2]} implausible for an indoor machine-hall scene"
+
+
+def test_check_parallax_accepts_real_baseline():
+    rng = np.random.default_rng(4)
+    X_true = np.array([0.3, -0.2, 4.0])
+    cameras = _synthetic_cameras(rng)
+    bearings = [_project_true(X_true, q, p) for q, p in cameras]
+    assert check_parallax(cameras, bearings, min_orthogonal_translation=0.2)
+
+
+def test_check_parallax_rejects_pure_along_ray_translation():
+    # camera looks straight down +z; moving along that exact ray gives zero parallax
+    # for a point on the ray, no matter how far the camera travels
+    X_true = np.array([0.0, 0.0, 10.0])
+    identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+    cameras = [(identity_q, np.array([0.0, 0.0, 0.0])), (identity_q, np.array([0.0, 0.0, 5.0]))]
+    bearings = [np.array([0.0, 0.0]), np.array([0.0, 0.0])]
+    assert not check_parallax(cameras, bearings, min_orthogonal_translation=0.2)
+
+
+def test_check_parallax_rejects_small_sideways_translation():
+    X_true = np.array([0.0, 0.0, 10.0])
+    identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+    cameras = [(identity_q, np.array([0.0, 0.0, 0.0])), (identity_q, np.array([0.01, 0.0, 0.0]))]
+    bearings = [np.array([0.0, 0.0]), np.array([0.0, 0.0])]
+    assert not check_parallax(cameras, bearings, min_orthogonal_translation=0.2)
+
+
+def test_check_cheirality_accepts_point_in_front_of_all_cameras():
+    rng = np.random.default_rng(5)
+    X_true = np.array([0.3, -0.2, 4.0])
+    cameras = _synthetic_cameras(rng)
+    assert check_cheirality(X_true, cameras)
+
+
+def test_check_cheirality_rejects_point_behind_a_camera():
+    identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+    cameras = [(identity_q, np.array([0.0, 0.0, 0.0])), (identity_q, np.array([1.0, 0.0, 0.0]))]
+    X_behind = np.array([0.0, 0.0, -5.0])  # behind both cameras, which look down +z
+    assert not check_cheirality(X_behind, cameras)
+
+
+def test_triangulate_and_validate_recovers_point_with_good_geometry():
+    rng = np.random.default_rng(6)
+    X_true = np.array([-1.0, 0.5, 6.0])
+    cameras = _synthetic_cameras(rng)
+    bearings = [_project_true(X_true, q, p) for q, p in cameras]
+
+    X_est = triangulate_and_validate(cameras, bearings, min_orthogonal_translation=0.2)
+    assert X_est is not None
+    assert np.allclose(X_est, X_true, atol=1e-6)
+
+
+def test_triangulate_and_validate_rejects_insufficient_parallax():
+    X_true = np.array([0.0, 0.0, 10.0])
+    identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+    cameras = [(identity_q, np.array([0.0, 0.0, 0.0])), (identity_q, np.array([0.0, 0.0, 5.0]))]
+    bearings = [np.array([0.0, 0.0]), np.array([0.0, 0.0])]
+    assert triangulate_and_validate(cameras, bearings, min_orthogonal_translation=0.2) is None
+
+
+def test_triangulate_and_validate_rejects_large_reprojection_error():
+    rng = np.random.default_rng(7)
+    X_true = np.array([0.5, 0.5, 5.0])
+    cameras = _synthetic_cameras(rng, n=6)
+    bearings = [_project_true(X_true, q, p) for q, p in cameras]
+    bearings[0] = bearings[0] + np.array([0.5, 0.5])  # one grossly mismatched observation
+
+    assert triangulate_and_validate(cameras, bearings, min_orthogonal_translation=0.2,
+                                     max_reprojection_error=0.05) is None
