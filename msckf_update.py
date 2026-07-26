@@ -5,6 +5,8 @@ covariance/state update.
 Error-state convention matches msckf_state.py/measurement_model.py exactly:
 delta_theta is a GLOBAL perturbation with R_true = (I + [delta_theta]x) @ R_hat.
 """
+from functools import lru_cache
+
 import numpy as np
 from scipy.stats import chi2
 
@@ -15,8 +17,14 @@ from quaternion_utils import axis_angle_to_quat, quat_multiply, quaternion_to_ro
 DEFAULT_CONFIDENCE = 0.95
 
 
+@lru_cache(maxsize=None)
 def chi_square_threshold(dof, confidence=DEFAULT_CONFIDENCE):
-    """Chi-square critical value for `dof` degrees of freedom at the given confidence level."""
+    """Chi-square critical value for `dof` degrees of freedom at the given confidence level.
+
+    Cached: callers (the vision chi-square gate, the GLRT stationarity detector)
+    hit this with the same handful of (dof, confidence) pairs thousands of times
+    per run, and scipy's chi2.ppf is expensive per call relative to a dict lookup.
+    """
     return chi2.ppf(confidence, dof)
 
 

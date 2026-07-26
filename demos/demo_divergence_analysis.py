@@ -69,6 +69,14 @@ DURATION_S = 60.0  # long enough to pass the point (~t=25-30s) where the residua
 MAX_CLONES = 20
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "divergence_analysis.png")
 
+# the filter is initialized exactly at ground truth, so pos_err/theta_err start at ~0 (floating-
+# point noise, not a real value) -- on a log-scale plot that briefly plunges to ~1e-16 and drags the
+# whole y-axis down with it, squashing every other value against the top of the plot. The lines
+# themselves are still drawn in full (that dip is real data, however uninteresting); only the
+# y-axis autoscale ignores these first few samples, in the two error-vs-bound panels only. The
+# onset/consistency analysis below always uses the full, untrimmed arrays regardless.
+PLOT_SKIP_S = 0.5
+
 # same independent "dummy bias" used throughout the demos -- see
 # demos/demo_mean_gravity_corrected_accel.py for how it was derived
 DUMMY_BIAS_GYRO = np.array([-0.00233173, 0.02172386, 0.07821335])
@@ -88,6 +96,23 @@ def _block_magnitude(diag_P, lo, hi):
     block's error vector under the filter's own Gaussian assumption, directly
     comparable to an actual error norm computed the same way."""
     return np.sqrt(np.sum(diag_P[lo:hi]))
+
+
+def _shade_stationary_intervals(ax, t, active):
+    """Light-grey background bands marking where _update_stationary_state's GLRT judged
+    the platform stationary -- i.e. where ZUPT/ZARU/gravity-alignment were actively
+    correcting the state instead of vision. Makes it visible at a glance whether a given
+    stretch of error growth (or flatness) happens during a stationary hold or real motion."""
+    edges = np.diff(active.astype(int))
+    starts = list(np.where(edges == 1)[0] + 1)
+    ends = list(np.where(edges == -1)[0] + 1)
+    if active[0]:
+        starts = [0] + starts
+    if active[-1]:
+        ends = ends + [len(active) - 1]
+    for i, (s, e) in enumerate(zip(starts, ends)):
+        ax.axvspan(t[s], t[e], color="lightgrey", alpha=0.6, zorder=0,
+                   label="Stationarity (ZUPT) active" if i == 0 else None)
 
 
 def main():
@@ -115,7 +140,7 @@ def main():
 
     history = {"t": [], "pos_err": [], "sigma_p": [], "theta_err": [], "b_g": [], "b_a": [],
                "sigma_theta": [], "sigma_bg": [], "sigma_v": [], "sigma_ba": [],
-               "n_updates": [], "n_rejected": []}
+               "n_updates": [], "n_rejected": [], "zupt_active": []}
 
     for frame_idx, (frame_t, image) in enumerate(frames):
         while imu_idx < len(imu_timestamps) and imu_timestamps[imu_idx] <= frame_t:
@@ -142,6 +167,11 @@ def main():
         history["sigma_ba"].append(_block_magnitude(diag_P, 9, 12))
         history["n_updates"].append(pipeline.n_updates_applied)
         history["n_rejected"].append(pipeline.n_tracks_rejected)
+        history["zupt_active"].append(pipeline._zupt_active)
+
+        if frame_idx % 50 == 0:
+            print(f"frame {frame_idx}/{n_frames}  pos_err={history['pos_err'][-1]:.4f}m  "
+                  f"theta_err={history['theta_err'][-1]:.4f}rad")
 
     t = np.array(history["t"])
     pos_err = np.array(history["pos_err"])
@@ -150,6 +180,7 @@ def main():
     sigma_theta = np.array(history["sigma_theta"])
     b_g = np.array(history["b_g"])
     b_a = np.array(history["b_a"])
+    zupt_active = np.array(history["zupt_active"])
 
     # when (if at all) does real error escape the filter's own 3-sigma confidence band?
     # early on, position sigma starts from a near-zero initial P0 and briefly lags behind
@@ -187,28 +218,38 @@ def main():
     print(f"Final accel bias: {pipeline.state.b_a}  (reference: {DUMMY_BIAS_ACCEL}, "
           f"|error|={np.linalg.norm(pipeline.state.b_a - DUMMY_BIAS_ACCEL):.4f})")
 
-    fig, axes = plt.subplot_mosaic([["err_pos", "err_theta"], ["bg", "ba"], ["cov", "cov"]],
+    fig, axes = plt.subplot_mosaic([["err_theta", "err_pos"], ["bg", "ba"], ["cov", "cov"]],
                                     figsize=(13, 11))
 
+    plot_mask = t >= PLOT_SKIP_S
+
     ax_err = axes["err_pos"]
+    _shade_stationary_intervals(ax_err, t, zupt_active)
     ax_err.semilogy(t, pos_err, color="tab:red", linewidth=1.8, label="Actual position error")
     ax_err.semilogy(t, 3 * sigma_p, color="tab:red", linestyle="--", linewidth=1.2,
                      label="Filter's own 3-sigma position bound")
     if sustained_onset is not None:
         ax_err.axvline(t[sustained_onset], color="black", linestyle=":", linewidth=1,
                         label=f"escapes 3-sigma bound (t={t[sustained_onset]:.1f}s)")
+    y_lo = min(pos_err[plot_mask].min(), (3 * sigma_p)[plot_mask].min())
+    y_hi = max(pos_err[plot_mask].max(), (3 * sigma_p)[plot_mask].max())
+    ax_err.set_ylim(y_lo * 0.5, y_hi * 1.5)
     ax_err.set_ylabel("Position error / bound (m, log scale)")
     ax_err.set_title("Position: divergence vs. predicted uncertainty")
     ax_err.legend(fontsize=8)
     ax_err.grid(True, which="both", alpha=0.3)
 
     ax_err_theta = axes["err_theta"]
+    _shade_stationary_intervals(ax_err_theta, t, zupt_active)
     ax_err_theta.semilogy(t, theta_err, color="tab:purple", linewidth=1.8, label="Actual orientation error")
     ax_err_theta.semilogy(t, 3 * sigma_theta, color="tab:purple", linestyle="--", linewidth=1.2,
                            label="Filter's own 3-sigma orientation bound")
     if theta_sustained_onset is not None:
         ax_err_theta.axvline(t[theta_sustained_onset], color="black", linestyle=":", linewidth=1,
                               label=f"escapes 3-sigma bound (t={t[theta_sustained_onset]:.1f}s)")
+    y_lo = min(theta_err[plot_mask].min(), (3 * sigma_theta)[plot_mask].min())
+    y_hi = max(theta_err[plot_mask].max(), (3 * sigma_theta)[plot_mask].max())
+    ax_err_theta.set_ylim(y_lo * 0.5, y_hi * 1.5)
     ax_err_theta.set_ylabel("Orientation error / bound (rad, log scale)")
     ax_err_theta.set_title("Orientation: divergence vs. predicted uncertainty")
     ax_err_theta.legend(fontsize=8)

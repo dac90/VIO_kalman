@@ -121,13 +121,20 @@ def propagate(state, gyro, accel, dt, noise_params):
     )
     Phi, Qd = discretize(F, G, Qc, dt)
 
-    n = state.P.shape[0]
-    Phi_full = np.eye(n)
-    Phi_full[:N_IMU_ERROR, :N_IMU_ERROR] = Phi
-    Qd_full = np.zeros((n, n))
-    Qd_full[:N_IMU_ERROR, :N_IMU_ERROR] = Qd
+    # Phi_full = [[Phi, 0], [0, I]] (clones are frozen copies, so they don't evolve
+    # under IMU propagation) -- applying it densely as an n x n matmul, n up to 135+,
+    # is O(n^3) for a result that's mostly a no-op. Block form below is exact (expand
+    # Phi_full @ P @ Phi_full.T + Qd_full and the identity blocks cancel out) and
+    # O(N_IMU_ERROR * n) instead: only the IMU/clone cross-covariance actually needs
+    # touching, and the clone-clone block passes through completely unchanged.
+    P = state.P
+    P_II = P[:N_IMU_ERROR, :N_IMU_ERROR]
+    P_IC = P[:N_IMU_ERROR, N_IMU_ERROR:]
 
-    new_P = Phi_full @ state.P @ Phi_full.T + Qd_full
+    new_P = P.copy()
+    new_P[:N_IMU_ERROR, :N_IMU_ERROR] = Phi @ P_II @ Phi.T + Qd
+    new_P[:N_IMU_ERROR, N_IMU_ERROR:] = Phi @ P_IC
+    new_P[N_IMU_ERROR:, :N_IMU_ERROR] = new_P[:N_IMU_ERROR, N_IMU_ERROR:].T
     new_P = 0.5 * (new_P + new_P.T)  # symmetrize away floating-point drift
 
     p_new, v_new, q_new = propagate_step(state.p, state.v, state.q, gyro, accel, dt,

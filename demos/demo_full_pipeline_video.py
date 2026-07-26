@@ -26,7 +26,7 @@ from msckf_state import load_imu_noise_params
 from quaternion_utils import quat_error_vector
 from triangulation import load_cam0_intrinsics
 
-DURATION_S = 120.0
+DURATION_S = 60.0
 MAX_CLONES = 20
 VIDEO_FPS = 20
 TRAIL_LENGTH = 20  # how many past observations to draw per tracked feature

@@ -164,6 +164,7 @@ from frames import body_to_sensor_position, load_T_BS
 from imu_propagation import _load_imu_measurements
 from msckf_pipeline import MSCKFPipeline
 from msckf_state import load_imu_noise_params
+from quaternion_utils import quat_error_vector
 from triangulation import load_cam0_intrinsics
 
 DURATION_S = 30.0
@@ -211,13 +212,21 @@ def main():
     imu_idx = np.searchsorted(imu_timestamps, t0, side="right")
     t_prev = t0
 
-    for frame_t, image in frames:
+    for frame_idx, (frame_t, image) in enumerate(frames):
         while imu_idx < len(imu_timestamps) and imu_timestamps[imu_idx] <= frame_t:
             t_curr = int(imu_timestamps[imu_idx])
             pipeline.process_imu(gyro[imu_idx], accel[imu_idx], (t_curr - t_prev) / 1e9)
             t_prev = t_curr
             imu_idx += 1
         pipeline.process_image(frame_t, image)
+
+        if frame_idx % 50 == 0:
+            gt_p = body_to_sensor_position(gt.interpolate_ground_truth_position(frame_t),
+                                            gt.interpolate_ground_truth_orientation(frame_t), T_BS_cam0)
+            gt_q = gt.interpolate_cam0_orientation(frame_t)
+            pos_err = np.linalg.norm(pipeline.state.clone_positions[-1] - gt_p)
+            theta_err = np.linalg.norm(quat_error_vector(gt_q, pipeline.state.clone_orientations[-1]))
+            print(f"frame {frame_idx}/{n_frames}  pos_err={pos_err:.4f}m  theta_err={theta_err:.4f}rad")
 
     timestamps, positions, _ = pipeline.full_trajectory()
     positions = np.array(positions)
