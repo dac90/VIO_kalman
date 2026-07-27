@@ -10,7 +10,7 @@ from triangulation import load_cam0_intrinsics
 
 # same "dummy bias" used throughout the demos -- an independent estimate, not
 # ground truth, but needed so the filter's own reported covariance stays
-# roughly matched to its real error (see demos/demo_msckf_update.py's note on
+# roughly matched to its real error (see test_demo/demo_msckf_update.py's note on
 # why zero-bias dead reckoning makes the chi-square gate reject everything)
 DUMMY_BIAS_GYRO = np.array([-0.00233173, 0.02172386, 0.07821335])
 DUMMY_BIAS_ACCEL = np.array([-0.04066623, 0.1155297, 0.05121861])

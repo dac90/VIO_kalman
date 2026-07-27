@@ -1,7 +1,7 @@
-"""Stage 8 capstone video: renders a live 2x2 dashboard as the full pipeline
-runs -- the trajectory and position-error plots growing frame by frame,
-alongside the raw cam0 feed and a feature-tracking visualization -- and
-writes it out as an MP4.
+"""Capstone video: renders a live 2x2 dashboard as the full pipeline runs --
+the ground-truth/estimate trajectory and the position/orientation error
+plots all growing frame by frame, alongside the raw cam0 feed and a
+feature-tracking visualization -- and writes it out as an MP4.
 
 Reuses demo_full_pipeline.py's exact setup (same duration, same dummy bias,
 same MAX_CLONES) so the numbers in the video match that demo's printed ATE/RPE.
@@ -9,7 +9,7 @@ same MAX_CLONES) so the numbers in the video match that demo's printed ATE/RPE.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import cv2
 import matplotlib
@@ -81,8 +81,8 @@ def main():
     imu_idx = np.searchsorted(imu_timestamps, t0, side="right")
     t_prev = t0
 
-    # ground truth for every frame's timestamp, computed up front for the
-    # trajectory plot's static reference line and the growing error curves
+    # ground truth for every frame's timestamp, computed up front so the trajectory and
+    # error panels can grow both curves frame by frame at video-render time
     gt_positions_full = np.array([body_to_sensor_position(gt.interpolate_ground_truth_position(t),
                                                             gt.interpolate_ground_truth_orientation(t), T_BS_cam0)
                                    for t, _ in frames])
@@ -95,7 +95,7 @@ def main():
     ax_cam = fig.add_subplot(2, 2, 3)
     ax_feat = fig.add_subplot(2, 2, 4)
 
-    ax_traj.plot(*gt_positions_full.T, color="tab:blue", label="Ground truth", linewidth=1)
+    (gt_line,) = ax_traj.plot([], [], [], color="tab:blue", label="Ground truth", linewidth=1)
     (est_line,) = ax_traj.plot([], [], [], color="tab:green", label="MSCKF estimate", linewidth=1.5)
     ax_traj.set_xlabel("X (m)")
     ax_traj.set_ylabel("Y (m)")
@@ -166,6 +166,10 @@ def main():
         est_arr = np.array(est_positions)
         est_line.set_data(est_arr[:, 0], est_arr[:, 1])
         est_line.set_3d_properties(est_arr[:, 2])
+
+        gt_so_far = gt_positions_full[:frame_idx + 1]
+        gt_line.set_data(gt_so_far[:, 0], gt_so_far[:, 1])
+        gt_line.set_3d_properties(gt_so_far[:, 2])
 
         err_line.set_data(time_history, error_history)
         if error_history[-1] > max_error_seen:

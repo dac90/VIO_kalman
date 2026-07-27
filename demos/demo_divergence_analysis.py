@@ -30,28 +30,19 @@ things against each other on a shared time axis:
      which blocks are collapsing (shrinking despite growing real error) vs.
      genuinely growing.
 
-See msckf_pipeline.py's and demo_full_pipeline.py's docstrings for the full
-history of this divergence investigation (the earlier finding that motivates
-this plot: pure IMU dead-reckoning diverged at almost the exact same rate as
-the "full" pipeline, and P's own reported velocity uncertainty stayed flat at
-~0.01-0.1 m/s throughout a run where the real velocity error grew past 11 m/s
--- i.e. exactly this kind of overconfidence, just far more severe before the
-sliding-window fix).
-
-MSCKFPipeline now also applies a zero-velocity update (ZUPT) whenever it
-detects the platform is stationary from raw IMU statistics -- added after the
-user noticed, from the video demo, that the divergence in this test window
-begins right when the drone lands and holds still (t~18-41s here). Watch the
-bottom-left accel-bias panel and the top panel together: with ZUPT, bias
-stays essentially flat and error stays sub-meter through the whole stationary
-segment, instead of both drifting steadily once the covariance floor alone
-was the only defense. To see the pre-ZUPT behavior this plot originally
-diagnosed, patch MSCKFPipeline(..., enable_zupt=False) into main() below.
+See msckf_pipeline.py's module docstring for the full mechanism this plot
+diagnoses (self-referential landmark triangulation making unobservable
+directions falsely confident) and for the ZUPT/ZARU/gravity-alignment trio
+applied whenever the platform is detected as stationary. Watch the
+bottom-left accel-bias panel and the top panel together: with that trio
+active, bias stays essentially flat and error stays sub-meter through the
+whole stationary segment (t~18-41s here). To see the pre-ZUPT behavior, patch
+MSCKFPipeline(..., enable_zupt=False) into main() below.
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -78,7 +69,7 @@ OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "divergen
 PLOT_SKIP_S = 0.5
 
 # same independent "dummy bias" used throughout the demos -- see
-# demos/demo_mean_gravity_corrected_accel.py for how it was derived
+# test_demo/demo_mean_gravity_corrected_accel.py for how it was derived
 DUMMY_BIAS_GYRO = np.array([-0.00233173, 0.02172386, 0.07821335])
 DUMMY_BIAS_ACCEL = np.array([-0.04066623, 0.1155297, 0.05121861])
 

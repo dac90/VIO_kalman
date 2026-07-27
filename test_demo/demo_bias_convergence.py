@@ -18,7 +18,7 @@ independent estimates is a meaningful sanity check either way.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,7 +38,7 @@ PROCESS_INTERVAL_FRAMES = 10  # batch newly-accumulated observations every 0.5s
 MIN_NEW_OBSERVATIONS = 6
 OBSERVATION_NOISE_STD = 1.0 / 458.0  # ~1 pixel, in normalized (bearing) units at cam0's focal length
 
-# independent reference from demos/demo_mean_gravity_corrected_accel.py -- NOT ground truth, just a sanity check
+# independent reference from demo_mean_gravity_corrected_accel.py -- NOT ground truth, just a sanity check
 REFERENCE_BIAS_GYRO = np.array([-0.00233173, 0.02172386, 0.07821335])
 REFERENCE_BIAS_ACCEL = np.array([-0.04066623, 0.1155297, 0.05121861])
 

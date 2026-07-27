@@ -5,7 +5,7 @@ and plots active-track-count and track-length statistics over the run.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import cv2
 import matplotlib.pyplot as plt

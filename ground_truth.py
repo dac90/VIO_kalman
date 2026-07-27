@@ -1,7 +1,5 @@
 """Ground-truth interpolation and plotting for the EuRoC MH_01_easy dataset.
 
-Mirrors the interpolation/plotting approach in main.py (built for the
-AGZ_subset PX4-log dataset), applied to EuRoC's mav0 layout:
 state_groundtruth_estimate0/data.csv holds the batch-optimized reference
 trajectory (position + orientation, already world-from-body), and
 leica0/data.csv holds the raw external position measurements it was derived
@@ -148,8 +146,10 @@ def plot_position_comparison(gt_positions, leica_positions, imu_positions):
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     ax.plot(gt_positions[:, 0], gt_positions[:, 1], gt_positions[:, 2], label="Ground Truth", color="tab:blue")
-    ax.plot(leica_positions[:, 0], leica_positions[:, 1], leica_positions[:, 2], label="Leica (interpolated)", color="tab:orange")
-    ax.plot(imu_positions[:, 0], imu_positions[:, 1], imu_positions[:, 2], label="IMU (dead reckoning)", color="tab:green")
+    ax.plot(leica_positions[:, 0], leica_positions[:, 1], leica_positions[:, 2],
+            label="Leica (interpolated)", color="tab:orange")
+    ax.plot(imu_positions[:, 0], imu_positions[:, 1], imu_positions[:, 2],
+            label="IMU (dead reckoning)", color="tab:green")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
@@ -235,7 +235,6 @@ if __name__ == "__main__":
     p0, q0, v0 = gt_raw_positions[0], gt_raw_quaternions[0], gt_raw_velocities[0]
     imu_timestamps, imu_positions_raw, _, imu_quaternions_raw = propagate_imu_trajectory(
         p0, v0, q0, int(gt_timestamps[0]))
-    #, os.path.join(os.path.dirname(os.path.abspath(__file__)), "machine_hall", "MH_01_easy", "MH_01_easy", "mav0"), np.array([-0.00233173, 0.02172386, 0.07821335]), np.array([-0.04066623, 0.1155297, 0.05121861]))
     imu_position_interp = SequentialInterpolator(imu_timestamps, imu_positions_raw,
                                                   exact_match_tolerance=EXACT_MATCH_TOLERANCE_NS)
     imu_orientation_interp = QuaternionSequentialInterpolator(imu_timestamps, imu_quaternions_raw,

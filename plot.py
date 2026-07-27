@@ -45,9 +45,9 @@ if __name__ == "__main__":
     ax_accel = fig.add_subplot(122, projection="3d")
 
     plot_time_coloured_3d(ax_gyro, gyro, ["Gyro X (rad/s)", "Gyro Y (rad/s)", "Gyro Z (rad/s)"],
-                          "Gyroscope 3D Scatter Plot")
+                           "Gyroscope 3D Scatter Plot")
     plot_time_coloured_3d(ax_accel, accel, ["Accel X (m/s^2)", "Accel Y (m/s^2)", "Accel Z (m/s^2)"],
-                          "Accelerometer 3D Scatter Plot")
+                           "Accelerometer 3D Scatter Plot")
 
     fig.suptitle("MH_01_easy imu0: Angular Velocity and Linear Acceleration")
     plt.show()

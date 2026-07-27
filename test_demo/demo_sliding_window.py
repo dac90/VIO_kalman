@@ -7,7 +7,7 @@ and state dimension staying bounded throughout instead of growing forever.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import matplotlib.pyplot as plt
 import numpy as np

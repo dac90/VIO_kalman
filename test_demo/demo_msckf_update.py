@@ -10,7 +10,7 @@ chi-square threshold.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for the top-level modules below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for top-level imports
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,7 +28,7 @@ N_FRAMES = 40  # 2s at 20Hz
 MIN_TRACK_LENGTH = 15
 OBSERVATION_NOISE_STD = 1.0 / 458.0  # ~1 pixel, in normalized (bearing) units at cam0's focal length
 
-# Same "dummy bias" from demos/demo_propagate_augment.py: without it, zero-bias
+# Same "dummy bias" from demo_propagate_augment.py: without it, zero-bias
 # dead reckoning's *real* error badly outpaces what the filter's own P
 # reports (P underestimates the truth, as that demo showed directly), so
 # nearly every honest measurement would look like a chi-square outlier

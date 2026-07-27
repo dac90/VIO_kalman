@@ -120,21 +120,16 @@ def zero_velocity_update(state, zupt_noise_std, min_variance=None):
     = -dh/dx convention (see ekf_update's docstring above), the velocity
     columns of H_o are -I and everything else is zero; r_o = 0 - v_hat = -v_hat.
 
-    Deliberately NOT a plain call to ekf_update: the mean correction (delta_x)
-    is restricted to the velocity block only, discarding whatever a full EKF
-    update's Kalman gain would otherwise apply to every other state through
-    P's cross-correlations (P's covariance update itself is left standard --
-    only the mean is restricted). Found necessary empirically: a real incident
-    on this dataset had a single confident ZUPT application drag gyro bias by
-    ~0.06 rad/s over a few seconds, via a b_g-v correlation built up earlier
-    during ordinary vision-based operation that (like everything else this
-    filter's self-referential-triangulation problem touches) wasn't well
-    calibrated. That's actively dangerous here specifically: the stationarity
-    detector itself bias-corrects raw gyro using this same state.b_g, so a
-    corrupted b_g made the detector see "false rotation" during a period that
-    was, per ground truth, still genuinely stationary -- causing ZUPT to shut
-    itself off for the ~13s it was needed most. A ZUPT should only ever be
-    allowed to assert what it actually measures.
+    Deliberately NOT a plain call to ekf_update: the mean correction (delta_x) is
+    restricted to the velocity block only, discarding whatever a full EKF update's Kalman
+    gain would otherwise apply to every other state through P's cross-correlations (the
+    covariance update itself is left standard -- only the mean is restricted). Needed because
+    an uncalibrated b_g-v correlation in P (built up during ordinary vision-based operation)
+    can otherwise let a single confident ZUPT drag gyro bias noticeably off course -- and
+    since the stationarity detector itself bias-corrects raw gyro using that same state.b_g,
+    a corrupted b_g can make the detector misread a genuinely stationary period as motion,
+    shutting ZUPT off exactly when it's needed. A ZUPT should only ever assert what it
+    actually measures.
     """
     n = state.P.shape[0]
     H_o = np.zeros((3, n))
